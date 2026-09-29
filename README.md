@@ -22,8 +22,8 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 # 3. Run a specific version (N is the matrix size; square matrix where M=N=K=N)
-./v0_naive 1024
-./v1_tile32 1024      # V1 generates separate executables for tile sizes 8, 16, and 32 (e.g., v1_tile8, v1_tile16, v1_tile32)
+./build/v0_naive 1024
+./build/v1_tile32 1024      # V1 generates separate executables for tile sizes 8, 16, and 32 (e.g., v1_tile8, v1_tile16, v1_tile32)
 
 # 4. Run batch benchmarks (execute from the project root directory)
 cd ..
