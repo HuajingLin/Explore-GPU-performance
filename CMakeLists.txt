@@ -4,7 +4,7 @@ project(ProgressivePerformanceMatrix LANGUAGES CXX CUDA)
 # ---------------------------------------------------------------------------
 # Usage Instructions
 # ---------------------------------------------------------------------------
-# If no dedicated GPU is available locally, clone this repository on Colab / Kaggle / AutoDL and run:
+# If no dedicated GPU is available locally, clone this repository on Colab and run:
 #   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75   # T4=75, V100=70, A100=80, 4090=89
 #   cmake --build build -j
 #
@@ -15,7 +15,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Default to T4 (most common on Colab/Kaggle) if not explicitly specified; override with -DCMAKE_CUDA_ARCHITECTURES=XX
+# Default to T4 (most common on Colab) if not explicitly specified; override with -DCMAKE_CUDA_ARCHITECTURES=XX
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 75)
 endif()
@@ -28,7 +28,7 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 # Enable ptxas register usage reporting; uncomment to enable:
-# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
@@ -50,6 +50,15 @@ target_compile_definitions(v1_tile${TILE} PRIVATE TILE_SIZE=${TILE})
 set_target_properties(v1_tile${TILE} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endforeach()
 
+# ---------------------------------------------------------------------------
+# V2: Register Blocking
+# Default TM=TN=4, extra TM=TN=8 used to comparison
+# ---------------------------------------------------------------------------
+foreach(T 4 8)
+    add_executable(v2_reg${T}x${T} src/v2_register_blocking.cu)
+    target_compile_definitions(v2_reg${T}x${T} PRIVATE TM=${T} TN=${T})
+    set_target_properties(v2_reg${T}x${T} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endforeach()
 
 
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")

@@ -30,7 +30,7 @@ for N in "${SIZES[@]}"; do
     echo "V0,NA,$N,$MS,$GF" >> "$OUT_CSV"
 done
 
-echo "=== run V1  ==="
+echo "=== run V1 (tile size comparison) ==="
 for T in "${TILES[@]}"; do
     for N in "${SIZES[@]}"; do
         OUT=$("$BUILD_DIR/v1_tile${T}" $N)
@@ -41,4 +41,16 @@ for T in "${TILES[@]}"; do
     done
 done
 
-echo "Complete, results written to $OUT_CSV"
+echo "=== run V2 (register blocking, TM/TN comparison) ==="
+REG_TILES=(4x4 8x8)
+for T in "${REG_TILES[@]}"; do
+    for N in "${SIZES[@]}"; do
+        OUT=$("$BUILD_DIR/v2_reg${T}" $N)
+        echo "$OUT"
+        MS=$(echo "$OUT" | grep -oP 'avg_time=\K[0-9.]+')
+        GF=$(echo "$OUT" | grep -oP 'GFLOPS=\K[0-9.]+')
+        echo "V2,$T,$N,$MS,$GF" >> "$OUT_CSV"
+    done
+done
+
+echo "finish, results written to $OUT_CSV"

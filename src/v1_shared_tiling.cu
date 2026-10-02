@@ -4,12 +4,11 @@
 // Improvement over V0: Introduces tiling by loading sub-blocks of A and B into shared memory for reuse,
 // thereby eliminating a large number of redundant global memory reads.
 // Each block is responsible for computing a TILE_SIZE x TILE_SIZE sub-block of C,
-// iterating along the K dimension to load tiles and accumulate results. //
-// Compile: nvcc -O3 -arch=sm_75 v1_shared_tiling.cu -o v1_shared_tiling
+// iterating along the K dimension to load tiles and accumulate results. 
 //
-// Run: ./v1_shared_tiling [N] [TILE]   (Default N=1024; TILE controlled by macro at compile time)
+// Run: ./build/v1_shared_tiling [N] [TILE]   (Default N=1024; TILE controlled by macro at compile time)
 //
-// Verification points (refer to README):
+// Verification points:
 //   - Shared memory usage = 2 * TILE_SIZE * TILE_SIZE * sizeof(float),
 //     must be <= 48KB/block; for TILE=32, it is 2*32*32*4 = 8192B, well below the limit.
 //   - Recommended to compile and run for TILE_SIZE = 8, 16, and 32 to perform a sensitivity scan.
@@ -22,9 +21,9 @@
 
 // ---------- Shared Memory Tiled GEMM Kernel ----------
 __global__ void tiled_gemm_kernel(const float* __restrict__ A,
-                                const float* __restrict__ B,
-                                float* __restrict__ C, int M, int N,
-                                int K) {
+                                  const float* __restrict__ B,
+                                  float* __restrict__ C, 
+                                  int M, int N, int K) {
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
@@ -46,7 +45,7 @@ __global__ void tiled_gemm_kernel(const float* __restrict__ A,
         __syncthreads();  // Ensure the entire tile is loaded
 
         // Accumulate along the K dimension, reusing data in shared memory
-        #pragma unroll
+        #pragma unroll  //Reduce the overhead of the loop itself.
         for (int k = 0; k < TILE_SIZE; ++k) {
             sum += As[ty][k] * Bs[k][tx];
         }
@@ -113,8 +112,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------- Benchmark ----------
-    float avg_ms = benchmark_kernel(
-    [&]() { run_tiled_gemm(d_A, d_B, d_C, M, N, K); });
+    float avg_ms = benchmark_kernel( [&]() { run_tiled_gemm(d_A, d_B, d_C, M, N, K); } );
     double gflops = compute_gflops(M, N, K, avg_ms);
 
     printf("  [bench] avg_time=%.3f ms, GFLOPS=%.2f\n", avg_ms, gflops);

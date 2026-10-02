@@ -8,7 +8,7 @@
 // Compile: nvcc -O3 -arch=sm_75 v0_naive.cu -o v0_naive
 // (sm_75 corresponds to T4; for Colab/Kaggle, adjust arch based on the actual GPU, e.g., sm_70/sm_80/sm_86)
 //
-// Run: ./v0_naive [N]   (Default N=1024, square matrix M=N=K=N)
+// Run: ./build/v0_naive [N]   (Default N=1024, square matrix M=N=K=N)
 
 #include "common.cuh"
 
@@ -34,7 +34,7 @@ __global__ void naive_gemm_kernel(const float* __restrict__ A,
 
 void run_naive_gemm(const float* d_A, const float* d_B, float* d_C, int M,
                     int N, int K) {
-    dim3 block(16, 16);
+    dim3 block(16, 16); //16 × 16 = 256 threads
     dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
     naive_gemm_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
 }
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice));
 
-    // ---------- Correctness verification (for large scales, use a small subset or reduce N for separate validation; here, N <= 512 is used for full CPU comparison) ----------
+    // ---------- Correctness verification (use a small  N <= 512 is used for full CPU comparison) ----------
     if (N <= 512) {
         run_naive_gemm(d_A, d_B, d_C, M, N, K);
         CUDA_CHECK(cudaMemcpy(h_C, d_C, size_C, cudaMemcpyDeviceToHost));
@@ -76,12 +76,13 @@ int main(int argc, char** argv) {
         verify_result(h_C, h_C_ref, M * N);
         free(h_C_ref);
     } else {
-        printf("  [verify] N > 512, skipping full CPU verification (too slow); suggest verifying correctness with a smaller scale separately\n");
+        printf("  [verify] N > 512, skipping full CPU verification (too slow).\n");
     }
 
     // ---------- Benchmark ----------
     float avg_ms = benchmark_kernel(
     [&]() { run_naive_gemm(d_A, d_B, d_C, M, N, K); });
+    
     double gflops = compute_gflops(M, N, K, avg_ms);
 
     printf("  [bench] avg_time=%.3f ms, GFLOPS=%.2f\n", avg_ms, gflops);
