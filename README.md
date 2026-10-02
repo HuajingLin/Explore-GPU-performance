@@ -29,18 +29,18 @@ cmake --build build -j
 ./build/v2_reg4x4 1024      # V2 v2_reg4x4 / v2_reg8x8 based on TM/TN. 
 
 # 4. Run batch benchmarks (execute from the project root directory)
-cd ..
 bash bench/bench.sh       # Results are written to results/results.csv
 ```
 
 ## T4 Measured Data
+```diff
 version,tile_size,N,   avg_ms, gflops
 V0,     NA,      1024, 6.114,  351.23
 V1,     32,      1024, 2.690,  798.25
 best speedup: 2.27x
+```
 
 ## Project layout
-
 ```
 gpu_perf/
 ├── CMakeLists.txt        # Build configuration
