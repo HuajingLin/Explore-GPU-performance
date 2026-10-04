@@ -28,6 +28,10 @@
 // Threads per block = Total output elements per block / Elements handled per thread
 #define NUM_THREADS ((BM * BN) / (TM * TN))
 
+//NCU measurements show a wavefront conflict rate of approximately 50%.
+//Pad the row width of As from BK to BK+1 so that the address interval across groups 
+//becomes TM*(BK+1)—no longer an integer multiple of 32—thereby eliminating this source of conflict.
+#define BK_PAD (BK + 1)
 // ---------- V2 Register Blocking Kernel ----------
 // C[M,N] = A[M,K] * B[K,N]
 // grid: (N/BN, M/BM)  block: (NUM_THREADS) 1D layout
@@ -42,7 +46,8 @@ __global__ void register_blocking_gemm_kernel(const float* __restrict__ A,
     const int threadCol = threadIdx.x % (BN / TN);
     const int threadRow = threadIdx.x / (BN / TN);
 
-    __shared__ float As[BM * BK];
+    //__shared__ float As[BM * BK];
+    __shared__ float As[BM * BK_PAD];
     __shared__ float Bs[BK * BN];
 
     // Shift A/B/C pointers to the start of the sub-block assigned to this block
@@ -70,7 +75,8 @@ __global__ void register_blocking_gemm_kernel(const float* __restrict__ A,
     for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
         // ---- Cooperatively load BM x BK block of A into shared memory ----
         for (int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
-            As[(innerRowA + loadOffset) * BK + innerColA] =
+            //As[(innerRowA + loadOffset) * BK + innerColA] =
+            As[(innerRowA + loadOffset) * BK_PAD + innerColA] =
             A[(innerRowA + loadOffset) * K + innerColA];
         }
 
@@ -92,7 +98,8 @@ __global__ void register_blocking_gemm_kernel(const float* __restrict__ A,
             // sharing the same threadRow group read identical addresses; this is a broadcast access
             // and does not cause bank conflicts.
             for (int i = 0; i < TM; ++i) {
-                regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+                //regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+                regM[i] = As[(threadRow * TM + i) * BK_PAD + dotIdx];
             }
 
             // Read the TN columns assigned to this thread — similarly, this is a broadcast access.
@@ -161,7 +168,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    size_t smem_bytes = (BM * BK + BK * BN) * sizeof(float);
+    //size_t smem_bytes = (BM * BK + BK * BN) * sizeof(float);
+    size_t smem_bytes = (BM * BK_PAD + BK * BN) * sizeof(float);
     printf("  shared memory per block = %zu bytes (limit 49152B)\n", smem_bytes);
 
     if (smem_bytes > 49152) {

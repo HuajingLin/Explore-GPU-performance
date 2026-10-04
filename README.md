@@ -25,7 +25,7 @@ cmake --build build -j
 
 # 3. Run a specific version (N is the matrix size; square matrix where M=N=K=N)
 ./build/v0_naive 1024
-./build/v1_tile32 1024      # V1 v1_tile8, v1_tile16, v1_tile32 based on tile sizes 8, 16, and 32 ( ..)
+./build/v1_tile32 1024      # V1 v1_tile8, v1_tile16, v1_tile32 based on tile sizes.
 ./build/v2_reg4x4 1024      # V2 v2_reg4x4 / v2_reg8x8 based on TM/TN. 
 
 # 4. Run batch benchmarks (execute from the project root directory)
@@ -34,10 +34,18 @@ bash bench/bench.sh       # Results are written to results/results.csv
 
 ## T4 Measured Data
 ```diff
+# V0 vs V1
 version,tile_size,N,   avg_ms, gflops
 V0,     NA,      1024, 6.114,  351.23
 V1,     32,      1024, 2.690,  798.25
 best speedup: 2.27x
+```
+```diff
+# V1 vs V2
+version,tile_size,N,   avg_ms, gflops
+V1,     32,      1024, 2.690,  798.25
+V2,     8*8,     1024, 1.193,  1799.68
+best speedup: 2.25x
 ```
 
 ## Project layout
@@ -52,6 +60,6 @@ gpu_perf/
     └── v2_register_blocking.cu
 ├── bench/
 │   └── bench.sh          # Batch compilation, scale sweeping, and CSV output
-├── results/               # Raw benchmark data (CSV) and summary plots (ignored by git; generated locally/in the cloud)
+├── results/              # Raw benchmark data (CSV) and summary plots (ignored by git)
 └── docs/                 # Nsight Compute screenshots and analysis notes
 ```
