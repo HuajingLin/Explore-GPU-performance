@@ -60,6 +60,12 @@ foreach(T 4 8)
     set_target_properties(v2_reg${T}x${T} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endforeach()
 
+# ---------------------------------------------------------------------------
+# V3: vectorized(float4) + Double Buffering
+# default BM=BN=128, BK=8, TM=TN=8
+# ---------------------------------------------------------------------------
+add_executable(v3_vecdbuf src/v3_vectorized_dbuf.cu)
+set_target_properties(v3_vecdbuf PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

@@ -24,9 +24,10 @@ cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 # 3. Run a specific version (N is the matrix size; square matrix where M=N=K=N)
-./build/v0_naive 1024
+./build/v0_naive 1024       # V0 naive
 ./build/v1_tile32 1024      # V1 v1_tile8, v1_tile16, v1_tile32 based on tile sizes.
 ./build/v2_reg4x4 1024      # V2 v2_reg4x4 / v2_reg8x8 based on TM/TN. 
+./build/v3_vecdbuf 1024     # V3: vectorized + double buffering
 
 # 4. Run batch benchmarks (execute from the project root directory)
 bash bench/bench.sh       # Results are written to results/results.csv
@@ -52,12 +53,14 @@ best speedup: 2.25x
 ```
 gpu_perf/
 ├── CMakeLists.txt        # Build configuration
+├── README.md
 ├── .gitignore
 ├── src/                  # Kernel source code for each version + common utilities
 │   ├── common.cuh        # Common utility functions
 │   ├── v0_naive.cu
 │   ├── v1_shared_tiling.cu
-    └── v2_register_blocking.cu
+│   ├── v2_register_blocking.cu
+│   └── v3_vectorized_dbuf.cu
 ├── bench/
 │   └── bench.sh          # Batch compilation, scale sweeping, and CSV output
 ├── results/              # Raw benchmark data (CSV) and summary plots (ignored by git)

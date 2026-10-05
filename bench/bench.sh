@@ -53,4 +53,13 @@ for T in "${REG_TILES[@]}"; do
     done
 done
 
+echo "=== run V3 (vectorized + double buffering) ==="
+for N in "${SIZES[@]}"; do
+    OUT=$("$BUILD_DIR/v3_vecdbuf" $N)
+    echo "$OUT"
+    MS=$(echo "$OUT" | grep -oP 'avg_time=\K[0-9.]+')
+    GF=$(echo "$OUT" | grep -oP 'GFLOPS=\K[0-9.]+')
+    echo "V3,NA,$N,$MS,$GF" >> "$OUT_CSV"
+done
+
 echo "finish, results written to $OUT_CSV"
