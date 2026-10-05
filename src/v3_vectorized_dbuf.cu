@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
     double gflops = compute_gflops(M, N, K, avg_ms);
 
     printf("  [bench] avg_time=%.3f ms, GFLOPS=%.2f\n", avg_ms, gflops);
-    printf("  Note: Compare against V2 (TM=TN=8, 1974 GFLOPS @ N=2048)"\n");
+    printf("  Note: Compare against V2 (TM=TN=8, 1974 GFLOPS @ N=2048)\n");
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
