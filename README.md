@@ -57,7 +57,7 @@ V3,     8*8,      1024, 0.774,  2774.02
 best speedup: 1.54x
 ```
 ```diff
-# V2 vs V3
+# V3 vs V4
 version,tile_size,N,    avg_ms, gflops
 V3,     8*8,      1024, 0.774,  2774.02
 V4,     ,         1024, 0.897,  2393.46
