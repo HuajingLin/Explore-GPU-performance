@@ -32,38 +32,42 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
     __shared__ float As[2][BK * BM];
     __shared__ float Bs[2][BK * BN];
 
-    // Starting points (base addresses) for the A, B, and C sub-blocks
+    // move pointers to the block that map to the thread.
     const float* Ab = A + (size_t)cRow * BM * K;
     const float* Bb = B + cCol * BN;
     float* Cb = C + (size_t)cRow * BM * N + cCol * BN;
 
-    // Index mapping for vectorized loading of A: each thread handles one float4 (covering 4 elements in the K dimension)
+    // each thread maps to 4 floats, 128 * 2 = 256.
     const int innerRowA = threadIdx.x / (BK / 4);  // 0..BM-1
     const int innerColA = threadIdx.x % (BK / 4);  // 0..(BK/4-1)
-    // Index mapping for vectorized loading of B: each thread handles one float4 (covering 4 elements in the N dimension)
+    // for B, 8 * 32 = 256
     const int innerRowB = threadIdx.x / (BN / 4);  // 0..BK-1
     const int innerColB = threadIdx.x % (BN / 4);  // 0..(BN/4-1)
 
-    float threadResults[TM * TN] = {0.0f};
-    float regM[TM] = {0.0f};
+    float threadResults[TM * TN] = {0.0f};  //one tile's reasult or one thread's result
+    float regM[TM] = {0.0f};    //M loop for calculate one row of tile
     float regN[TN] = {0.0f};
     float4 prefetchA, prefetchB;  // Prefetch registers for double buffering
 
-    // ---------- Prologue: Synchronously load the first tile into buffer 0 ----------
+    // ---------- Prologue: Synchronously load the first 4 floats into buffer 0 ----------
     {
+        // each time load 4 floats, 256 * 4 = 1024 floats, which is the size of (BM * BK) = (128 * 8).
+        // full load shared memory, the thread maxtrix for A is (128 * 2)
     float4 tmpA = reinterpret_cast<const float4*>( &Ab[innerRowA * K + 0 + innerColA * 4] )[0];
+    //A transpose
     As[0][(innerColA * 4 + 0) * BM + innerRowA] = tmpA.x;
     As[0][(innerColA * 4 + 1) * BM + innerRowA] = tmpA.y;
     As[0][(innerColA * 4 + 2) * BM + innerRowA] = tmpA.z;
     As[0][(innerColA * 4 + 3) * BM + innerRowA] = tmpA.w;
 
+    //the thread maxtrix for B is (8 * 32)
     float4 tmpB = reinterpret_cast<const float4*>( &Bb[(0 + innerRowB) * N + innerColB * 4] )[0];
     reinterpret_cast<float4*>(&Bs[0][innerRowB * BN + innerColB * 4])[0] = tmpB;
     }
     __syncthreads();
 
     int curBuf = 0;
-
+    //forward on the K dimension in steps of BK
     for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
         int nextBkIdx = bkIdx + BK;
         bool hasNext = nextBkIdx < K;
@@ -82,7 +86,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             #pragma unroll
             for (int i = 0; i < TM; i += 4) {
                 float4 tmp = reinterpret_cast<float4*>(
-                &As[curBuf][dotIdx * BM + threadRow * TM + i])[0];
+                    &As[curBuf][dotIdx * BM + threadRow * TM + i])[0];
                 regM[i + 0] = tmp.x;
                 regM[i + 1] = tmp.y;
                 regM[i + 2] = tmp.z;
@@ -92,7 +96,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             #pragma unroll
             for (int i = 0; i < TN; i += 4) {
                 float4 tmp = reinterpret_cast<float4*>(
-                &Bs[curBuf][dotIdx * BN + threadCol * TN + i])[0];
+                    &Bs[curBuf][dotIdx * BN + threadCol * TN + i])[0];
                 regN[i + 0] = tmp.x;
                 regN[i + 1] = tmp.y;
                 regN[i + 2] = tmp.z;
@@ -102,8 +106,8 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
                 #pragma unroll
                 for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
-                threadResults[resIdxM * TN + resIdxN] +=
-                regM[resIdxM] * regN[resIdxN]; }
+                    threadResults[resIdxM * TN + resIdxN] +=
+                    regM[resIdxM] * regN[resIdxN]; }
             }
         }
 
@@ -114,8 +118,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             As[nextBuf][(innerColA * 4 + 1) * BM + innerRowA] = prefetchA.y;
             As[nextBuf][(innerColA * 4 + 2) * BM + innerRowA] = prefetchA.z;
             As[nextBuf][(innerColA * 4 + 3) * BM + innerRowA] = prefetchA.w;
-            reinterpret_cast<float4*>(
-            &Bs[nextBuf][innerRowB * BN + innerColB * 4])[0] = prefetchB;
+            reinterpret_cast<float4*>( &Bs[nextBuf][innerRowB * BN + innerColB * 4] )[0] = prefetchB;
 
             __syncthreads();  // Ensure all threads have finished writing to nextBuf before safe reading in the next iteration
             curBuf = nextBuf;

@@ -2,7 +2,7 @@
 
 A progressive CUDA GEMM (General Matrix Multiply) optimization project: starting with a single base compute kernel, five versions are developed—each introducing exactly one specific optimization technique—to demonstrate through quantifiable metrics "why" and "where" the performance improves at each step.   
     
-[project WIKI](https://github.com/HuajingLin/gpu_perf/wiki/Progressive-Performance-Matrix-on-GPU)   
+[project WIKI](https://github.com/HuajingLin/Explore-GPU-performance/wiki/Progressive-Performance-Matrix-on-GPU)   
     
 ## Environment
 
@@ -28,6 +28,7 @@ cmake --build build -j
 ./build/v1_tile32 1024      # V1 v1_tile8, v1_tile16, v1_tile32 based on tile sizes.
 ./build/v2_reg4x4 1024      # V2 v2_reg4x4 / v2_reg8x8 based on TM/TN. 
 ./build/v3_vecdbuf 1024     # V3: vectorized + double buffering
+./build/v4_wmma 1024        # V4: WMMA Tensor Core (FP16) + cuBLAS comparison
 
 # 4. Run batch benchmarks (execute from the project root directory)
 bash bench/bench.sh       # Results are written to results/results.csv
@@ -48,6 +49,13 @@ V1,     32,      1024, 2.690,  798.25
 V2,     8*8,     1024, 1.193,  1799.68
 best speedup: 2.25x
 ```
+```diff
+# V2 vs V3
+version,tile_size,N,    avg_ms, gflops
+V2,     8*8,      1024, 1.193,  1799.68
+V3,     8*8,      1024, 0.774,  2774.02
+best speedup: 1.54x
+```
 
 ## Project layout
 ```
@@ -60,7 +68,8 @@ gpu_perf/
 │   ├── v0_naive.cu
 │   ├── v1_shared_tiling.cu
 │   ├── v2_register_blocking.cu
-│   └── v3_vectorized_dbuf.cu
+│   ├── v3_vectorized_dbuf.cu
+│   └── v4_wmma_tensorcore.cu
 ├── bench/
 │   └── bench.sh          # Batch compilation, scale sweeping, and CSV output
 ├── results/              # Raw benchmark data (CSV) and summary plots (ignored by git)

@@ -62,4 +62,13 @@ for N in "${SIZES[@]}"; do
     echo "V3,NA,$N,$MS,$GF" >> "$OUT_CSV"
 done
 
+echo "=== run V4 (WMMA Tensor Core, FP16) ==="
+for N in "${SIZES[@]}"; do
+    OUT=$("$BUILD_DIR/v4_wmma" $N)
+    echo "$OUT"
+    MS=$(echo "$OUT" | grep -oP 'My WMMA kernel: avg_time=\K[0-9.]+')
+    GF=$(echo "$OUT" | grep -oP 'My WMMA kernel:.*GFLOPS=\K[0-9.]+')
+    echo "V4,NA,$N,$MS,$GF" >> "$OUT_CSV"
+done
+
 echo "finish, results written to $OUT_CSV"

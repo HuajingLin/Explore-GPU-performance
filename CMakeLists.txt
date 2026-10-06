@@ -45,9 +45,9 @@ set_target_properties(v0_naive PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 # without requiring manual code modification and recompilation.
 # ---------------------------------------------------------------------------
 foreach(TILE 8 16 32)
-add_executable(v1_tile${TILE} src/v1_shared_tiling.cu)
-target_compile_definitions(v1_tile${TILE} PRIVATE TILE_SIZE=${TILE})
-set_target_properties(v1_tile${TILE} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_executable(v1_tile${TILE} src/v1_shared_tiling.cu)
+    target_compile_definitions(v1_tile${TILE} PRIVATE TILE_SIZE=${TILE})
+    set_target_properties(v1_tile${TILE} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endforeach()
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,15 @@ endforeach()
 # ---------------------------------------------------------------------------
 add_executable(v3_vecdbuf src/v3_vectorized_dbuf.cu)
 set_target_properties(v3_vecdbuf PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# ---------------------------------------------------------------------------
+# V4: Warp-level optimization / Tensor Core
+# wmma + cuBLAS comparison
+# ---------------------------------------------------------------------------
+find_package(CUDAToolkit REQUIRED)
+add_executable(v4_wmma src/v4_wmma_tensorcore.cu)
+target_link_libraries(v4_wmma PRIVATE CUDA::cublas)
+set_target_properties(v4_wmma PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
