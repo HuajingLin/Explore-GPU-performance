@@ -22,7 +22,7 @@ using namespace nvcuda;
     } while (0)
 
 // ---------- Convert FP32 matrix to FP16 (Host-side) ----------
-void Convert_to_half(const float* src, half* dst, size_t n) {
+void convert_to_half(const float* src, half* dst, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         dst[i] = __float2half(src[i]);
     }
