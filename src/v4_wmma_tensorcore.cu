@@ -38,15 +38,13 @@ __global__ void wmma_naive_gemm_kernel(const half* __restrict__ A,
                                             float* __restrict__ C, 
                                             int M, int N, int K) {
     // Global warp coordinates: each warp computes a 16x16 output tile
+    //4 warps along the M direction;  4 warps along the N direction.
     int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
     int warpN = blockIdx.y * blockDim.y + threadIdx.y;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half,
-    wmma::row_major>
-    a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half,
-    wmma::row_major>
-    b_frag;
+    //fragment: tile
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
     wmma::fill_fragment(acc_frag, 0.0f);
 
@@ -67,11 +65,10 @@ __global__ void wmma_naive_gemm_kernel(const half* __restrict__ A,
 }
 
 void run_wmma_gemm(const half* d_A, const half* d_B, float* d_C, int M, int N, int K) {
-    // blockDim.x=128 => 128/32=4 warps along the M-dimension; blockDim.y=4 => 4 warps along the N-dimension
+    // blockDim.x=128 => 128/32=4 warps
     // Each block has a total of 16 warps, responsible for a (4*WMMA_M) x (4*WMMA_N) = 64x64 output tile
     dim3 blockDim(128, 4);
-    dim3 gridDim((M + (WMMA_M * (blockDim.x / 32)) - 1) /
-    (WMMA_M * (blockDim.x / 32)),
+    dim3 gridDim((M + (WMMA_M * (blockDim.x / 32)) - 1) / (WMMA_M * (blockDim.x / 32)),
     (N + (WMMA_N * blockDim.y) - 1) / (WMMA_N * blockDim.y));
     wmma_naive_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
@@ -152,11 +149,11 @@ int main(int argc, char** argv) {
         // FP16 precision is limited, so tolerance is relaxed to atol=0.5, rtol=5%
         // (significantly looser than the 1e-3 used previously;
         // this is due to the inherent precision of FP16 inputs, not a kernel implementation error)
-        printf("  [verify wmma kernel] (Note: FP16 precision; tolerances relaxed to atol=0.5/rtol=5%)\n");
+        printf("  [verify wmma kernel] (Note: FP16 precision; tolerances relaxed to atol=0.5/rtol=5%%)\n");
         verify_result(h_C_wmma, h_C_ref, (int)size_C, 0.5f, 0.05f);
         free(h_C_ref);
     } else {
-        printf("  [verify] N > 512; skipping full CPU verification (too slow). Suggest verifying correctness separately using a smaller scale.\n");
+        printf("  [verify] N > 512; skipping full CPU verification (too slow). \n");
     }
 
     // ---------- Benchmark: Our WMMA kernel ----------
