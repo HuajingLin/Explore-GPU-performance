@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     half *h_A_f16, *h_B_f16;
     h_A_f16 = (half*)malloc(size_A * sizeof(half));
     h_B_f16 = (half*)malloc(size_B * sizeof(half));
-    
+
     convert_to_half(h_A_f32, h_A_f16, size_A);
     convert_to_half(h_B_f32, h_B_f16, size_B);
 
