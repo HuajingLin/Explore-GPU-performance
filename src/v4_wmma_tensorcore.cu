@@ -123,7 +123,9 @@ int main(int argc, char** argv) {
 
     half *h_A_f16, *h_B_f16;
     h_A_f16 = (half*)malloc(size_A * sizeof(half));
-    h_B_f16 = (half*)malloc(size_B * sizeof(half)); convert_to_half(h_A_f32, h_A_f16, size_A);
+    h_B_f16 = (half*)malloc(size_B * sizeof(half));
+    
+    convert_to_half(h_A_f32, h_A_f16, size_A);
     convert_to_half(h_B_f32, h_B_f16, size_B);
 
     // ---- device side// Allocate device memory ----
@@ -170,7 +172,7 @@ int main(int argc, char** argv) {
     float avg_ms_cublas = benchmark_kernel([&]() {
         run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
     });
-    
+
     double gflops_cublas = compute_gflops(M, N, K, avg_ms_cublas);
     printf("  [bench] cuBLAS (TensorCore): avg_time=%.3f ms, GFLOPS=%.2f\n", avg_ms_cublas, gflops_cublas);
 
