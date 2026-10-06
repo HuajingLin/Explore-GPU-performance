@@ -11,15 +11,15 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
-#define CUBLAS_CHECK(call) \
-do {                                                                    \
-    cublasStatus_t status = (call); \
-    if (status != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error at %s:%d: status=%d\n", __FILE__, \
-        __LINE__, (int)status); \
-        exit(EXIT_FAILURE); \
-    } \
-} while (0)
+#define CUBLAS_CHECK(call)                                                  \
+    do {                                                                    \
+        cublasStatus_t status = (call);                                     \
+        if (status != CUBLAS_STATUS_SUCCESS) {                              \
+            fprintf(stderr, "cuBLAS error at %s:%d: status=%d\n", __FILE__, \
+            __LINE__, (int)status);                                         \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
 
 // ---------- Convert FP32 matrix to FP16 (Host-side) ----------
 void Convert_to_half(const float* src, half* dst, size_t n) {
