@@ -18,6 +18,12 @@
 
 #define NUM_THREADS ((BM * BN) / (TM * TN))
 
+#define AS_PITCH (BM + 4)
+
+__device__ __forceinline__ int bphys4(int n4) {
+    return (n4 & 1) * (BN / 8) + (n4 >> 1);
+}
+
 __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
                                             const float* __restrict__ B,
                                                   float* __restrict__ C, 
@@ -29,7 +35,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
     const int threadRow = threadIdx.x / (BN / TN);
 
     // Double-buffered shared memory: alternating use of [0] and [1]
-    __shared__ float As[2][BK * BM];
+    __shared__ float As[2][BK * AS_PITCH];
     __shared__ float Bs[2][BK * BN];
 
     // move pointers to the block that map to the thread.
@@ -55,14 +61,16 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
         // full load shared memory, the thread maxtrix for A is (128 * 2)
     float4 tmpA = reinterpret_cast<const float4*>( &Ab[innerRowA * K + 0 + innerColA * 4] )[0];
     //A transpose
-    As[0][(innerColA * 4 + 0) * BM + innerRowA] = tmpA.x;
-    As[0][(innerColA * 4 + 1) * BM + innerRowA] = tmpA.y;
-    As[0][(innerColA * 4 + 2) * BM + innerRowA] = tmpA.z;
-    As[0][(innerColA * 4 + 3) * BM + innerRowA] = tmpA.w;
+    As[0][(innerColA * 4 + 0) * AS_PITCH + innerRowA] = tmpA.x;
+    As[0][(innerColA * 4 + 1) * AS_PITCH + innerRowA] = tmpA.y;
+    As[0][(innerColA * 4 + 2) * AS_PITCH + innerRowA] = tmpA.z;
+    As[0][(innerColA * 4 + 3) * AS_PITCH + innerRowA] = tmpA.w;
 
     //the thread maxtrix for B is (8 * 32)
     float4 tmpB = reinterpret_cast<const float4*>( &Bb[(0 + innerRowB) * N + innerColB * 4] )[0];
-    reinterpret_cast<float4*>(&Bs[0][innerRowB * BN + innerColB * 4])[0] = tmpB;
+
+    //reinterpret_cast<float4*>(&Bs[0][innerRowB * BN + innerColB * 4])[0] = tmpB;
+    reinterpret_cast<float4*>(&Bs[0][innerRowB * BN + bphys4(innerColB) * 4])[0] = tmpB;
     }
     __syncthreads();
 
@@ -86,7 +94,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             #pragma unroll
             for (int i = 0; i < TM; i += 4) {
                 float4 tmp = reinterpret_cast<float4*>(
-                    &As[curBuf][dotIdx * BM + threadRow * TM + i])[0];
+                    &As[curBuf][dotIdx * AS_PITCH + threadRow * TM + i])[0];
                 regM[i + 0] = tmp.x;
                 regM[i + 1] = tmp.y;
                 regM[i + 2] = tmp.z;
@@ -96,7 +104,8 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
             #pragma unroll
             for (int i = 0; i < TN; i += 4) {
                 float4 tmp = reinterpret_cast<float4*>(
-                    &Bs[curBuf][dotIdx * BN + threadCol * TN + i])[0];
+                    &Bs[curBuf][dotIdx * BN +
+                                bphys4(threadCol * 2 + i / 4) * 4])[0];
                 regN[i + 0] = tmp.x;
                 regN[i + 1] = tmp.y;
                 regN[i + 2] = tmp.z;
@@ -114,12 +123,14 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
         // ---- Computation complete; write the previously prefetched data for the next tile into the other buffer ----
         if (hasNext) {
             int nextBuf = 1 - curBuf;
-            As[nextBuf][(innerColA * 4 + 0) * BM + innerRowA] = prefetchA.x;
-            As[nextBuf][(innerColA * 4 + 1) * BM + innerRowA] = prefetchA.y;
-            As[nextBuf][(innerColA * 4 + 2) * BM + innerRowA] = prefetchA.z;
-            As[nextBuf][(innerColA * 4 + 3) * BM + innerRowA] = prefetchA.w;
-            reinterpret_cast<float4*>( &Bs[nextBuf][innerRowB * BN + innerColB * 4] )[0] = prefetchB;
-
+            As[nextBuf][(innerColA * 4 + 0) * AS_PITCH + innerRowA] = prefetchA.x;
+            As[nextBuf][(innerColA * 4 + 1) * AS_PITCH + innerRowA] = prefetchA.y;
+            As[nextBuf][(innerColA * 4 + 2) * AS_PITCH + innerRowA] = prefetchA.z;
+            As[nextBuf][(innerColA * 4 + 3) * AS_PITCH + innerRowA] = prefetchA.w;
+            //reinterpret_cast<float4*>( &Bs[nextBuf][innerRowB * BN + innerColB * 4] )[0] = prefetchB;
+            reinterpret_cast<float4*>(
+                &Bs[nextBuf][innerRowB * BN + bphys4(innerColB) * 4])[0] =
+                prefetchB;
             __syncthreads();  // Ensure all threads have finished writing to nextBuf before safe reading in the next iteration
             curBuf = nextBuf;
         }
@@ -172,7 +183,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    size_t smem_bytes = 2 * (BK * BM + BK * BN) * sizeof(float);  // Double buffering (x2)
+    size_t smem_bytes = 2 * (BK * AS_PITCH + BK * BN) * sizeof(float);  // Double buffering (x2)
     printf("  shared memory per block = %zu bytes (limit 49152B, including double buffering x2)\n", smem_bytes);
     if (smem_bytes > 49152) {
         fprintf(stderr, "ERROR: Shared memory exceeds limit\n");
