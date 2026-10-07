@@ -18,10 +18,19 @@
 
 #define NUM_THREADS ((BM * BN) / (TM * TN))
 
+// V3.1
 #define AS_PITCH (BM + 4)
 
+// V3.1
 __device__ __forceinline__ int bphys4(int n4) {
     return (n4 & 1) * (BN / 8) + (n4 >> 1);
+}
+
+// V3.2
+__device__ __forceinline__ int bswz_write_col(int tid) {
+    int q = (tid & 31) >> 3;
+    int r = tid & 7;
+    return 2 * (r + 8 * (q & 1)) + (q >> 1);
 }
 
 __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
@@ -48,7 +57,8 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
     const int innerColA = threadIdx.x % (BK / 4);  // 0..(BK/4-1)
     // for B, 8 * 32 = 256
     const int innerRowB = threadIdx.x / (BN / 4);  // 0..BK-1
-    const int innerColB = threadIdx.x % (BN / 4);  // 0..(BN/4-1)
+    //const int innerColB = threadIdx.x % (BN / 4);  // 0..(BN/4-1)
+    const int innerColB = tbswz_write_col(threadIdx.x);
 
     float threadResults[TM * TN] = {0.0f};  //one tile's reasult or one thread's result
     float regM[TM] = {0.0f};    //M loop for calculate one row of tile
