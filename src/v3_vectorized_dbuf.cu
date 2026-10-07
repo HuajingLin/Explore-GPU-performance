@@ -58,7 +58,7 @@ __global__ void vectorized_dbuf_gemm_kernel(const float* __restrict__ A,
     // for B, 8 * 32 = 256
     const int innerRowB = threadIdx.x / (BN / 4);  // 0..BK-1
     //const int innerColB = threadIdx.x % (BN / 4);  // 0..(BN/4-1)
-    const int innerColB = tbswz_write_col(threadIdx.x);
+    const int innerColB = bswz_write_col(threadIdx.x);
 
     float threadResults[TM * TN] = {0.0f};  //one tile's reasult or one thread's result
     float regM[TM] = {0.0f};    //M loop for calculate one row of tile
