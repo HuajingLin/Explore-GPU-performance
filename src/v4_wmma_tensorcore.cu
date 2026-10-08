@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     size_t size_C = static_cast<size_t>(M) * N;
 
     // ---- Host side: generate FP32 data and convert to FP16 ----
-    float *h_A_f32, *h_B_f32, *h_C_wmma, h_C_tiled, *h_C_cublas;
+    float *h_A_f32, *h_B_f32, *h_C_wmma, *h_C_tiled, *h_C_cublas;
     h_A_f32 = (float*)malloc(size_A * sizeof(float));
     h_B_f32 = (float*)malloc(size_B * sizeof(float));
     h_C_wmma = (float*)malloc(size_C * sizeof(float));
