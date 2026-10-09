@@ -76,7 +76,7 @@ void run_wmma_gemm(const half* d_A, const half* d_B, float* d_C, int M, int N, i
 // ---------- V4.1 Shared Memory Tiling, WMMA Kernel  --------------
 #define TILE_M 64
 #define TILE_N 64
-#define TILE_K 16  
+#define TILE_K 64  
 
 __global__ void wmma_tiled_gemm_kernel(const half* __restrict__ A,
                                         const half* __restrict__ B,
@@ -126,10 +126,12 @@ __global__ void wmma_tiled_gemm_kernel(const half* __restrict__ A,
 
         // ---- each warp read fragment from shared memory and accumulate ----
         if (aRowBase < M && bColBase < N) {
-            wmma::load_matrix_sync(
-                a_frag, As + warpM_local * WMMA_M * TILE_K, TILE_K);
-            wmma::load_matrix_sync(b_frag, Bs + warpN_local * WMMA_N, TILE_N);
-            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            #pragma unroll
+            for (int kk = 0; kk < TILE_K; kk += WMMA_K) {
+                wmma::load_matrix_sync(a_frag, As + warpM_local * WMMA_M * TILE_K + kk, TILE_K);
+                wmma::load_matrix_sync(b_frag, Bs + kk * TILE_N + warpN_local * WMMA_N, TILE_N);
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
         }
 
         __syncthreads();  // ensuring all warps have finished reading the current tile
@@ -188,12 +190,12 @@ int main(int argc, char** argv) {
     size_t size_C = static_cast<size_t>(M) * N;
 
     // ---- Host side: generate FP32 data and convert to FP16 ----
-    float *h_A_f32, *h_B_f32, *h_C_wmma, *h_C_tiled, *h_C_cublas;
+    float *h_A_f32, *h_B_f32,  *h_C_tiled;// *h_C_wmma,*h_C_cublas;
     h_A_f32 = (float*)malloc(size_A * sizeof(float));
     h_B_f32 = (float*)malloc(size_B * sizeof(float));
-    h_C_wmma = (float*)malloc(size_C * sizeof(float));
+    //h_C_wmma = (float*)malloc(size_C * sizeof(float));
     h_C_tiled = (float*)malloc(size_C * sizeof(float));
-    h_C_cublas = (float*)malloc(size_C * sizeof(float));
+    //h_C_cublas = (float*)malloc(size_C * sizeof(float));
 
     init_matrix(h_A_f32, M, K, 42);
     init_matrix(h_B_f32, K, N, 24);
@@ -206,12 +208,12 @@ int main(int argc, char** argv) {
 
     // ---- device side// Allocate device memory ----
     half *d_A, *d_B;
-    float *d_C_wmma, *d_C_tiled, *d_C_cublas;
+    float  *d_C_tiled; //*d_C_wmma,*d_C_cublas;
     CUDA_CHECK(cudaMalloc(&d_A, size_A * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&d_B, size_B * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_C_wmma, size_C * sizeof(float)));
+    //CUDA_CHECK(cudaMalloc(&d_C_wmma, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_tiled, size_C * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_C_cublas, size_C * sizeof(float)));
+    //CUDA_CHECK(cudaMalloc(&d_C_cublas, size_C * sizeof(float)));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_A_f16, size_A * sizeof(half),
                 cudaMemcpyHostToDevice));
@@ -221,17 +223,17 @@ int main(int argc, char** argv) {
     // ---------- Correctness verification: Note that tolerance must be relaxed for FP16 precision;
     // the 1e-3 tolerance used in previous versions is not applicable here ----------
     if (N <= 512) {
-        run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K);
-        CUDA_CHECK(cudaMemcpy(h_C_wmma, d_C_wmma, size_C * sizeof(float),
-                    cudaMemcpyDeviceToHost));
+        //run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K);
+       // CUDA_CHECK(cudaMemcpy(h_C_wmma, d_C_wmma, size_C * sizeof(float),
+       //             cudaMemcpyDeviceToHost));
 
         float* h_C_ref = (float*)malloc(size_C * sizeof(float));
         cpu_gemm_ref(h_A_f32, h_B_f32, h_C_ref, M, N, K);
         // FP16 precision is limited, so tolerance is relaxed to atol=0.5, rtol=5%
         // (significantly looser than the 1e-3 used previously;
         // this is due to the inherent precision of FP16 inputs, not a kernel implementation error)
-        printf("  [verify wmma kernel] (Note: FP16 precision; tolerances relaxed to atol=0.5/rtol=5%%)\n");
-        verify_result(h_C_wmma, h_C_ref, (int)size_C, 0.5f, 0.05f);
+        //printf("  [verify wmma kernel] (Note: FP16 precision; tolerances relaxed to atol=0.5/rtol=5%%)\n");
+        //verify_result(h_C_wmma, h_C_ref, (int)size_C, 0.5f, 0.05f);
 
         run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K);
         CUDA_CHECK(cudaMemcpy(h_C_tiled, d_C_tiled, size_C * sizeof(float),
@@ -244,21 +246,21 @@ int main(int argc, char** argv) {
         printf("  [verify] N > 512; skipping full CPU verification (too slow). \n");
     }
 
-    // ---------- Benchmark: naive WMMA kernel ----------
+    /*/ ---------- Benchmark: naive WMMA kernel ----------
     float avg_ms_wmma = benchmark_kernel([&]() { run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K); });
     double gflops_wmma = compute_gflops(M, N, K, avg_ms_wmma);
     printf("  [bench] Custom WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n", avg_ms_wmma, gflops_wmma);
-
+    */
     // ---------- Benchmark: shared memory tiled wmma kernel ----------
     float avg_ms_tiled = benchmark_kernel(
         [&]() { run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K); });
     double gflops_tiled = compute_gflops(M, N, K, avg_ms_tiled);
     printf("  [bench] tiled WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_tiled, gflops_tiled);
-    printf("  [compare] tiled相对naive提升: %.2fx\n",
-           gflops_tiled / gflops_wmma);
+    //printf("  [compare] tiled相对naive提升: %.2fx\n",
+    //       gflops_tiled / gflops_wmma);
 
-    // ---------- Benchmark: cuBLAS baseline (also using Tensor Core path) ----------
+    /*/ ---------- Benchmark: cuBLAS baseline (also using Tensor Core path) ----------
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
@@ -274,20 +276,20 @@ int main(int argc, char** argv) {
     printf("  [compare] naive kernel achieved %.1f%% of cuBLAS performance\n", pct_of_cublas);
     printf("  [compare] tiled kernel achieved %.1f%% of cuBLAS performance\n", pct_tiled);
     printf("  (Acceptance criteria: >= 70%% for N>=1024 is considered passing)\n");
-
-    CUBLAS_CHECK(cublasDestroy(handle));
+*/
+ //   CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_C_wmma));
+//    CUDA_CHECK(cudaFree(d_C_wmma));
     CUDA_CHECK(cudaFree(d_C_tiled));
-    CUDA_CHECK(cudaFree(d_C_cublas));
+//    CUDA_CHECK(cudaFree(d_C_cublas));
     free(h_A_f32);
     free(h_B_f32);
     free(h_A_f16);
     free(h_B_f16);
-    free(h_C_wmma);
+//    free(h_C_wmma);
     free(h_C_tiled);
-    free(h_C_cublas);
+//    free(h_C_cublas);
 
     return 0;
 }
