@@ -31,7 +31,7 @@ void convert_to_half(const float* src, half* dst, size_t n) {
 // ---------- V4 base WMMA Tensor Core Kernel ----------
 __global__ void wmma_naive_gemm_kernel(const half* __restrict__ A,
                                         const half* __restrict__ B,
-                                        float* __restrict__ C, int M, int N,
+                                        float* __restrict__ C, int M, int N,int K) {
     //each warp:16x16
     int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
     int warpN = blockIdx.y * blockDim.y + threadIdx.y;
