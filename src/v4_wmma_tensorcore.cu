@@ -73,7 +73,7 @@ void run_wmma_gemm(const half* d_A, const half* d_B, float* d_C, int M,
 
 #define TILE_M 64
 #define TILE_N 64
-#define TILE_K 32  
+#define TILE_K 16  
 
 __global__ void wmma_tiled_gemm_kernel(const half* __restrict__ A,
                                         const half* __restrict__ B,

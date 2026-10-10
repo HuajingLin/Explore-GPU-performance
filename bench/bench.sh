@@ -63,12 +63,22 @@ for N in "${SIZES[@]}"; do
 done
 
 echo "=== run V4 (WMMA Tensor Core, FP16) ==="
+V4_CSV="results/results_v4_fp16.csv"
+echo "kernel,N,avg_ms,gflops" > "$V4_CSV"
 for N in "${SIZES[@]}"; do
     OUT=$("$BUILD_DIR/v4_wmma" $N)
     echo "$OUT"
-    MS=$(echo "$OUT" | grep -oP 'My WMMA kernel: avg_time=\K[0-9.]+')
-    GF=$(echo "$OUT" | grep -oP 'My WMMA kernel:.*GFLOPS=\K[0-9.]+')
-    echo "V4,NA,$N,$MS,$GF" >> "$OUT_CSV"
+    for pair in "naive:naive WMMA kernel" "tiled:tiled WMMA kernel" \
+                "tiled_dbuf:tiled+dbuf WMMA kernel" "cublas:cuBLAS(TensorCore)"; do
+        KEY="${pair%%:*}"
+        PATTERN="${pair#*:}"
+        LINE=$(echo "$OUT" | grep "$PATTERN")
+        MS=$(echo "$LINE" | grep -oP 'avg_time=\K[0-9.]+')
+        GF=$(echo "$LINE" | grep -oP 'GFLOPS=\K[0-9.]+')
+        if [ -n "$MS" ] && [ -n "$GF" ]; then
+            echo "$KEY,$N,$MS,$GF" >> "$V4_CSV"
+        fi
+    done
 done
 
-echo "finish, results written to $OUT_CSV"
+echo "finish, results written to $OUT_CSV and $V4_CSV"
