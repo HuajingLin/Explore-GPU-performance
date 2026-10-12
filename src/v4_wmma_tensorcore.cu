@@ -269,7 +269,7 @@ void run_wmma_tiled_dbuf_gemm(const half* d_A, const half* d_B, float* d_C,
     wmma_tiled_dbuf_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
 
-#define WARP_TILE_M 2  // number of WMMA_M tiles each warp computes, M direction
+#define WARP_TILE_M 4  // number of WMMA_M tiles each warp computes, M direction
 #define WARP_TILE_N 2  // number of WMMA_N tiles each warp computes, N direction
 #define WARPS_M (TILE_M / (WARP_TILE_M * WMMA_M))  // = 64/32 = 2 warps along M
 #define WARPS_N (TILE_N / (WARP_TILE_N * WMMA_N))  // = 64/32 = 2 warps along N
@@ -532,7 +532,7 @@ int main(int argc, char** argv) {
     double gflops_warptile = compute_gflops(M, N, K, avg_ms_warptile);
     printf("  [bench] warptile WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_warptile, gflops_warptile);
-    printf("  [compare] warptile over tiled+dbuf promote: %.2fx\n",
+    printf("  [compare] warptile over tiled promote: %.2fx\n",
            gflops_warptile / gflops_tiled);
 
     // ---------- Benchmark: cuBLAS run Tensor Core----------
