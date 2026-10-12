@@ -452,7 +452,7 @@ int main(int argc, char** argv) {
 
     // ---- device memory ----
     half *d_A, *d_B;
-    float *d_C_wmma, *d_C_tiled, *d_C_dbuf, *d_C_cublas;
+    float *d_C_wmma, *d_C_tiled, *d_C_dbuf, *d_C_warptile, *d_C_cublas;
     CUDA_CHECK(cudaMalloc(&d_A, size_A * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&d_B, size_B * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&d_C_wmma, size_C * sizeof(float)));
