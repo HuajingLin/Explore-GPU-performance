@@ -269,6 +269,135 @@ void run_wmma_tiled_dbuf_gemm(const half* d_A, const half* d_B, float* d_C,
     wmma_tiled_dbuf_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
 
+#define WARP_TILE_M 2  // number of WMMA_M tiles each warp computes, M direction
+#define WARP_TILE_N 2  // number of WMMA_N tiles each warp computes, N direction
+#define WARPS_M (TILE_M / (WARP_TILE_M * WMMA_M))  // = 64/32 = 2 warps along M
+#define WARPS_N (TILE_N / (WARP_TILE_N * WMMA_N))  // = 64/32 = 2 warps along N
+
+__global__ void wmma_warptile_gemm_kernel(const half* __restrict__ A,
+                                           const half* __restrict__ B,
+                                           float* __restrict__ C, int M,
+                                           int N, int K) {
+    int cRow = blockIdx.x;  // block's M-direction tile index
+    int cCol = blockIdx.y;  // block's N-direction tile index
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;  // flattened thread id within block
+    int totalThreads = blockDim.x * blockDim.y;         // 128 for this kernel
+
+    int warpM_local = threadIdx.x / warpSize;  // 0..WARPS_M-1 (0..1)
+    int warpN_local = threadIdx.y;             // 0..WARPS_N-1 (0..1)
+
+    // This warp's output region, in local (block-relative) coordinates
+    int warpRowBase = warpM_local * WARP_TILE_M * WMMA_M;  // 0 or 32
+    int warpColBase = warpN_local * WARP_TILE_N * WMMA_N;  // 0 or 32
+
+    // This warp's output region, in global matrix coordinates
+    int aRowBase = cRow * TILE_M + warpRowBase;
+    int bColBase = cCol * TILE_N + warpColBase;
+
+    __shared__ half As[TILE_M * TILE_K];  // row-major, row stride = TILE_K
+    __shared__ half Bs[TILE_K * TILE_N];  // row-major, row stride = TILE_N
+
+    const half* Ab = A + (size_t)cRow * TILE_M * K;
+    const half* Bb = B + cCol * TILE_N;
+
+    // Each warp holds WARP_TILE_M a_frags, WARP_TILE_N b_frags, and the
+    // full WARP_TILE_M x WARP_TILE_N cross-product of acc_frags
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half,
+                    wmma::row_major>
+        a_frag[WARP_TILE_M];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half,
+                    wmma::row_major>
+        b_frag[WARP_TILE_N];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
+        acc_frag[WARP_TILE_M][WARP_TILE_N];
+
+#pragma unroll
+    for (int i = 0; i < WARP_TILE_M; ++i) {
+#pragma unroll
+        for (int j = 0; j < WARP_TILE_N; ++j) {
+            wmma::fill_fragment(acc_frag[i][j], 0.0f);
+        }
+    }
+
+    for (int bkIdx = 0; bkIdx < K; bkIdx += TILE_K) {
+        // ---- cooperative load of As (TILE_M x TILE_K) ----
+        for (int idx = tid; idx < TILE_M * TILE_K; idx += totalThreads) {
+            int localRow = idx / TILE_K;
+            int localCol = idx % TILE_K;
+            As[idx] = Ab[(size_t)localRow * K + bkIdx + localCol];
+        }
+        // ---- cooperative load of Bs (TILE_K x TILE_N) ----
+        for (int idx = tid; idx < TILE_K * TILE_N; idx += totalThreads) {
+            int localRow = idx / TILE_N;
+            int localCol = idx % TILE_N;
+            Bs[idx] = Bb[(size_t)(bkIdx + localRow) * N + localCol];
+        }
+        __syncthreads();  // wait until shared memory tile is fully loaded
+
+        // ---- each warp loads its WARP_TILE_M a_frags and WARP_TILE_N
+        // b_frags once, then reuses them across the WARP_TILE_M x
+        // WARP_TILE_N cross-product of mma_sync calls (this is exactly
+        // the "1:1 load:compute ratio" described above) ----
+        if (aRowBase < M && bColBase < N) {
+#pragma unroll
+            for (int kk = 0; kk < TILE_K; kk += WMMA_K) {
+#pragma unroll
+                for (int i = 0; i < WARP_TILE_M; ++i) {
+                    wmma::load_matrix_sync(
+                        a_frag[i],
+                        As + (warpRowBase + i * WMMA_M) * TILE_K + kk,
+                        TILE_K);
+                }
+#pragma unroll
+                for (int j = 0; j < WARP_TILE_N; ++j) {
+                    wmma::load_matrix_sync(
+                        b_frag[j],
+                        Bs + kk * TILE_N + (warpColBase + j * WMMA_N),
+                        TILE_N);
+                }
+#pragma unroll
+                for (int i = 0; i < WARP_TILE_M; ++i) {
+#pragma unroll
+                    for (int j = 0; j < WARP_TILE_N; ++j) {
+                        wmma::mma_sync(acc_frag[i][j], a_frag[i], b_frag[j],
+                                        acc_frag[i][j]);
+                    }
+                }
+            }
+        }
+
+        __syncthreads();  // make sure every warp is done reading before the
+                           // next iteration overwrites shared memory
+    }
+
+    // ---- write back all WARP_TILE_M x WARP_TILE_N accumulator tiles ----
+    if (aRowBase < M && bColBase < N) {
+#pragma unroll
+        for (int i = 0; i < WARP_TILE_M; ++i) {
+#pragma unroll
+            for (int j = 0; j < WARP_TILE_N; ++j) {
+                int row = aRowBase + i * WMMA_M;
+                int col = bColBase + j * WMMA_N;
+                wmma::store_matrix_sync(C + (size_t)row * N + col,
+                                         acc_frag[i][j], N,
+                                         wmma::mem_row_major);
+            }
+        }
+    }
+}
+
+void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
+                             int M, int N, int K) {
+    // blockDim: WARPS_M*32 threads along x (2 warps x 32 = 64), WARPS_N
+    // along y (2) -> 128 threads = 4 warps per block, covering the same
+    // TILE_M x TILE_N = 64x64 output region as V4b/c/d, just with fewer,
+    // "fatter" warps instead of 16 "thin" ones.
+    dim3 blockDim(WARPS_M * 32, WARPS_N);
+    dim3 gridDim(M / TILE_M, N / TILE_N);
+    wmma_warptile_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
+}
+
 // ---------- cuBLAS
 
 void run_cublas_gemm(cublasHandle_t handle, const half* d_A, const half* d_B,
@@ -303,12 +432,13 @@ int main(int argc, char** argv) {
     size_t size_C = static_cast<size_t>(M) * N;
 
     // ---- host: FP32 to FP16 ----
-    float *h_A_f32, *h_B_f32, *h_C_wmma, *h_C_tiled, *h_C_dbuf, *h_C_cublas;
+    float *h_A_f32, *h_B_f32, *h_C_wmma, *h_C_tiled, *h_C_dbuf, *h_C_warptile, *h_C_cublas;
     h_A_f32 = (float*)malloc(size_A * sizeof(float));
     h_B_f32 = (float*)malloc(size_B * sizeof(float));
     h_C_wmma = (float*)malloc(size_C * sizeof(float));
     h_C_tiled = (float*)malloc(size_C * sizeof(float));
     h_C_dbuf = (float*)malloc(size_C * sizeof(float));
+    h_C_warptile = (float*)malloc(size_C * sizeof(float));
     h_C_cublas = (float*)malloc(size_C * sizeof(float));
 
     init_matrix(h_A_f32, M, K, 42);
@@ -328,6 +458,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_C_wmma, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_tiled, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_dbuf, size_C * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_C_warptile, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_cublas, size_C * sizeof(float)));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_A_f16, size_A * sizeof(half),
@@ -359,6 +490,12 @@ int main(int argc, char** argv) {
         printf("  [verify tiled+dbuf wmma kernel]\n");
         verify_result(h_C_dbuf, h_C_ref, (int)size_C, 0.5f, 0.05f);
 
+        run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K);
+        CUDA_CHECK(cudaMemcpy(h_C_warptile, d_C_warptile,
+                               size_C * sizeof(float), cudaMemcpyDeviceToHost));
+        printf("  [verify warptile wmma kernel]\n");
+        verify_result(h_C_warptile, h_C_ref, (int)size_C, 0.5f, 0.05f);
+
         free(h_C_ref);
     } else {
         printf("  [verify] N>512 skip\n");
@@ -377,7 +514,7 @@ int main(int argc, char** argv) {
     double gflops_tiled = compute_gflops(M, N, K, avg_ms_tiled);
     printf("  [bench] tiled WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_tiled, gflops_tiled);
-    printf("  [compare] tiled相对naive提升: %.2fx\n",
+    printf("  [compare] tiled over naive promote: %.2fx\n",
            gflops_tiled / gflops_wmma);
 
     // ---------- Benchmark: tiled + double buffering wmma kernel ----------
@@ -388,6 +525,15 @@ int main(int argc, char** argv) {
            avg_ms_dbuf, gflops_dbuf);
     printf("  [compare] tiled+dbuf over tiled promote: %.2fx\n",
            gflops_dbuf / gflops_tiled);
+
+    // ---------- Benchmark: warp-level multi-fragment tiling wmma kernel ----------
+    float avg_ms_warptile = benchmark_kernel(
+        [&]() { run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K); });
+    double gflops_warptile = compute_gflops(M, N, K, avg_ms_warptile);
+    printf("  [bench] warptile WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
+           avg_ms_warptile, gflops_warptile);
+    printf("  [compare] warptile over tiled+dbuf promote: %.2fx\n",
+           gflops_warptile / gflops_tiled);
 
     // ---------- Benchmark: cuBLAS run Tensor Core----------
     cublasHandle_t handle;
@@ -403,9 +549,11 @@ int main(int argc, char** argv) {
     double pct_naive = 100.0 * gflops_wmma / gflops_cublas;
     double pct_tiled = 100.0 * gflops_tiled / gflops_cublas;
     double pct_dbuf = 100.0 * gflops_dbuf / gflops_cublas;
+    double pct_warptile = 100.0 * gflops_warptile / gflops_cublas;
     printf("  [compare] naive kernel achieving cuBLAS performance %.1f%%\n", pct_naive);
     printf("  [compare] tiled kernel achieving cuBLAS performance %.1f%%\n", pct_tiled);
     printf("  [compare] tiled+dbuf kernel achieving cuBLAS performance %.1f%%\n", pct_dbuf);
+    printf("  [compare] warptile kernel achieving cuBLAS performance %.1f%%\n", pct_warptile);
     printf("  (Acceptance Criteria: N>=1024 >= 70%% Deemed to meet the standard.)\n");
 
     CUBLAS_CHECK(cublasDestroy(handle));
@@ -414,6 +562,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_C_wmma));
     CUDA_CHECK(cudaFree(d_C_tiled));
     CUDA_CHECK(cudaFree(d_C_dbuf));
+    CUDA_CHECK(cudaFree(d_C_warptile));
     CUDA_CHECK(cudaFree(d_C_cublas));
     free(h_A_f32);
     free(h_B_f32);
@@ -422,6 +571,7 @@ int main(int argc, char** argv) {
     free(h_C_wmma);
     free(h_C_tiled);
     free(h_C_dbuf);
+    free(h_C_warptile);
     free(h_C_cublas);
 
     return 0;
