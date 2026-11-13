@@ -415,8 +415,10 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
 //   kWM x kWN  : output tile per warp (multiples of 16)
 // Requirements: M % kBM == 0, N % kBN == 0, K % kBK == 0.
 
-template <int kBM, int kBN, int kBK, int kWM, int kWN>
-__global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32)
+// kMinBlocks > 1 asks the compiler to fit that many blocks per SM, which caps
+// registers per thread (65536 / (threads * kMinBlocks)); watch for spills.
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+__global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32, kMinBlocks)
 wmma_blocktile_gemm_kernel(const half* __restrict__ A,
                            const half* __restrict__ B,
                            float* __restrict__ C, int M, int N, int K) {
@@ -562,48 +564,78 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
         }
 }
 
-template <int kBM, int kBN, int kBK, int kWM, int kWN>
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
 bool v4e_shape_ok(int M, int N, int K) {
     return (M % kBM == 0) && (N % kBN == 0) && (K % kBK == 0);
 }
 
-template <int kBM, int kBN, int kBK, int kWM, int kWN>
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
 void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
     dim3 block(kThreads);
     dim3 grid(N / kBN, M / kBM);
-    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN>
+    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks>
         <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
 }
 
-// The three T4 sweep configs (40 SMs -> tile size decides wave count)
-//   V4e-128x128 : 8 warps of 64x32
-//   V4e-128x64  : 4 warps of 64x32
-//   V4e-64x64   : 4 warps of 32x32
+// Prints registers, local memory (spills), static smem and how many blocks
+// fit per SM, as reported by the runtime for the compiled kernel.
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+void print_v4e_attrs(const char* name) {
+    auto kern = wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks>;
+    constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
+    cudaFuncAttributes attr;
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, kern));
+    int blocksPerSM = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSM, kern,
+                                                             kThreads, 0));
+    printf("  [attr] %-18s threads=%3d regs=%3d local(spill)=%4zu B "
+           "smem=%6zu B blocks/SM=%d\n",
+           name, kThreads, attr.numRegs, attr.localSizeBytes,
+           attr.sharedSizeBytes, blocksPerSM);
+}
+
+// T4 sweep configs (40 SMs -> tile size decides wave count)
+//   V4e-128x128      : 8 warps of 64x32, BK=32  (~38 KB smem, 1 block/SM)
+//   V4e-128x64       : 4 warps of 64x32, BK=32
+//   V4e-64x64        : 4 warps of 32x32, BK=32
+//   V4e-128x128-k16  : as A but BK=16   (~21 KB smem)
+//   V4e-128x128-k16m2: as D plus __launch_bounds__(256, 2) -> <=128 regs,
+//                      so 2 blocks/SM and all 64 blocks at N=1024 in one wave
 #define V4E_CFG_A 128, 128, 32, 64, 32
 #define V4E_CFG_B 128, 64, 32, 64, 32
 #define V4E_CFG_C 64, 64, 32, 32, 32
-#define V4E_NUM_CFGS 3
-static const char* V4E_NAMES[V4E_NUM_CFGS] = {"V4e-128x128", "V4e-128x64",
-                                              "V4e-64x64"};
+#define V4E_CFG_D 128, 128, 16, 64, 32
+#define V4E_CFG_E 128, 128, 16, 64, 32, 2
+#define V4E_NUM_CFGS 5
+static const char* V4E_NAMES[V4E_NUM_CFGS] = {
+    "V4e-128x128", "V4e-128x64", "V4e-64x64", "V4e-128x128-k16",
+    "V4e-128x128-k16m2"};
 
-// Launch config `cfg` (0..2). Returns false if the shape doesn't fit.
+void print_all_v4e_attrs() {
+    print_v4e_attrs<V4E_CFG_A>(V4E_NAMES[0]);
+    print_v4e_attrs<V4E_CFG_B>(V4E_NAMES[1]);
+    print_v4e_attrs<V4E_CFG_C>(V4E_NAMES[2]);
+    print_v4e_attrs<V4E_CFG_D>(V4E_NAMES[3]);
+    print_v4e_attrs<V4E_CFG_E>(V4E_NAMES[4]);
+}
+
+#define V4E_CASE(idx, CFG)                                              \
+    case idx:                                                           \
+        if (!v4e_shape_ok<CFG>(M, N, K)) return false;                  \
+        run_wmma_blocktile_gemm<CFG>(d_A, d_B, d_C, M, N, K);           \
+        return true;
+
+// Launch config `cfg` (0..V4E_NUM_CFGS-1). Returns false if the shape doesn't fit.
 bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
                  int N, int K) {
     switch (cfg) {
-        case 0:
-            if (!v4e_shape_ok<V4E_CFG_A>(M, N, K)) return false;
-            run_wmma_blocktile_gemm<V4E_CFG_A>(d_A, d_B, d_C, M, N, K);
-            return true;
-        case 1:
-            if (!v4e_shape_ok<V4E_CFG_B>(M, N, K)) return false;
-            run_wmma_blocktile_gemm<V4E_CFG_B>(d_A, d_B, d_C, M, N, K);
-            return true;
-        case 2:
-            if (!v4e_shape_ok<V4E_CFG_C>(M, N, K)) return false;
-            run_wmma_blocktile_gemm<V4E_CFG_C>(d_A, d_B, d_C, M, N, K);
-            return true;
+        V4E_CASE(0, V4E_CFG_A)
+        V4E_CASE(1, V4E_CFG_B)
+        V4E_CASE(2, V4E_CFG_C)
+        V4E_CASE(3, V4E_CFG_D)
+        V4E_CASE(4, V4E_CFG_E)
     }
     return false;
 }
@@ -625,6 +657,7 @@ int main(int argc, char** argv) {
 
     printf("=== V4 WMMA Tensor Core GEMM (FP16 input, FP32 accumulate) ===\n");
     printf("M=%d N=%d K=%d\n", M, N, K);
+    print_all_v4e_attrs();
 
     if (M % WMMA_M != 0 || N % WMMA_N != 0 || K % WMMA_K != 0) {
         fprintf(stderr, "ERROR: M/N/K Must be divisible by 16.\n");
@@ -765,7 +798,7 @@ int main(int argc, char** argv) {
            gflops_warptile / gflops_tiled);
 
     // ---------- Benchmark: V4e tile sweep ----------
-    double gflops_v4e[V4E_NUM_CFGS] = {0.0, 0.0, 0.0};
+    double gflops_v4e[V4E_NUM_CFGS] = {};
     for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
         if (!run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K)) {
             printf("  [bench] %s: skipped (shape not divisible)\n",
