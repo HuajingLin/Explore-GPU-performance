@@ -13,6 +13,8 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
+#include <algorithm>
+#include <vector>
 
 using namespace nvcuda;
 
@@ -600,25 +602,23 @@ void print_v4e_attrs(const char* name) {
 //   V4e-128x128      : 8 warps of 64x32, BK=32  (~38 KB smem, 1 block/SM)
 //   V4e-128x64       : 4 warps of 64x32, BK=32
 //   V4e-64x64        : 4 warps of 32x32, BK=32
-//   V4e-128x128-k16  : as A but BK=16   (~21 KB smem)
-//   V4e-128x128-k16m2: as D plus __launch_bounds__(256, 2) -> <=128 regs,
-//                      so 2 blocks/SM and all 64 blocks at N=1024 in one wave
+//   V4e-128x128-w64  : 4 warps of 64x64, BK=32 (4x4 fragments per warp:
+//                      8 fragment loads feed 16 MMAs, vs 6 -> 8 in config A)
+// Dropped after the T4 sweep: BK=16 variants (2 blocks/SM fit without spills
+// but were 8-45% slower than A -> blocks/SM was not the limiter).
 #define V4E_CFG_A 128, 128, 32, 64, 32
 #define V4E_CFG_B 128, 64, 32, 64, 32
 #define V4E_CFG_C 64, 64, 32, 32, 32
-#define V4E_CFG_D 128, 128, 16, 64, 32
-#define V4E_CFG_E 128, 128, 16, 64, 32, 2
-#define V4E_NUM_CFGS 5
+#define V4E_CFG_D 128, 128, 32, 64, 64
+#define V4E_NUM_CFGS 4
 static const char* V4E_NAMES[V4E_NUM_CFGS] = {
-    "V4e-128x128", "V4e-128x64", "V4e-64x64", "V4e-128x128-k16",
-    "V4e-128x128-k16m2"};
+    "V4e-128x128", "V4e-128x64", "V4e-64x64", "V4e-128x128-w64"};
 
 void print_all_v4e_attrs() {
     print_v4e_attrs<V4E_CFG_A>(V4E_NAMES[0]);
     print_v4e_attrs<V4E_CFG_B>(V4E_NAMES[1]);
     print_v4e_attrs<V4E_CFG_C>(V4E_NAMES[2]);
     print_v4e_attrs<V4E_CFG_D>(V4E_NAMES[3]);
-    print_v4e_attrs<V4E_CFG_E>(V4E_NAMES[4]);
 }
 
 #define V4E_CASE(idx, CFG)                                              \
@@ -635,7 +635,6 @@ bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
         V4E_CASE(1, V4E_CFG_B)
         V4E_CASE(2, V4E_CFG_C)
         V4E_CASE(3, V4E_CFG_D)
-        V4E_CASE(4, V4E_CFG_E)
     }
     return false;
 }
@@ -846,7 +845,56 @@ int main(int argc, char** argv) {
     if (best_cfg >= 0)
         printf("  [sweep] best V4e config at N=%d: %s (%.1f%% of cuBLAS)\n", N,
                V4E_NAMES[best_cfg], 100.0 * gflops_v4e[best_cfg] / gflops_cublas);
+
+    // ---------- Robust ratio: repeated rounds, cuBLAS measured around each ----------
+    // Colab T4 clocks drift between and within runs (cuBLAS at N=2048 was
+    // measured at both ~30 and ~40 TFLOPS). A single cuBLAS sample makes the
+    // "% of cuBLAS" number unreliable, so each round measures cuBLAS right
+    // before and right after the V4e configs and divides by their mean.
+    // We report the median ratio over all rounds plus its min..max spread.
+    const int kRounds = 7;
+    std::vector<double> cub_gf;
+    std::vector<std::vector<double>> ratio(V4E_NUM_CFGS);
+    auto bench_cublas_gf = [&]() {
+        float ms = benchmark_kernel([&]() {
+            run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
+        });
+        return compute_gflops(M, N, K, ms);
+    };
+    for (int r = 0; r < kRounds; ++r) {
+        double before = bench_cublas_gf();
+        double gf[V4E_NUM_CFGS] = {};
+        for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+            if (gflops_v4e[cfg] <= 0.0) continue;  // shape not supported
+            float ms = benchmark_kernel(
+                [&]() { run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K); });
+            gf[cfg] = compute_gflops(M, N, K, ms);
+        }
+        double after = bench_cublas_gf();
+        double cub = 0.5 * (before + after);
+        cub_gf.push_back(before);
+        cub_gf.push_back(after);
+        for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg)
+            if (gf[cfg] > 0.0) ratio[cfg].push_back(100.0 * gf[cfg] / cub);
+    }
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        size_t n = v.size();
+        return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    };
+    printf("  [robust] %d rounds; cuBLAS GFLOPS median=%.0f (min %.0f, max %.0f)\n",
+           kRounds, median(cub_gf),
+           *std::min_element(cub_gf.begin(), cub_gf.end()),
+           *std::max_element(cub_gf.begin(), cub_gf.end()));
+    for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+        if (ratio[cfg].empty()) continue;
+        printf("  [robust] %-16s %% of cuBLAS: median=%.1f%% (min %.1f%%, max %.1f%%)\n",
+               V4E_NAMES[cfg], median(ratio[cfg]),
+               *std::min_element(ratio[cfg].begin(), ratio[cfg].end()),
+               *std::max_element(ratio[cfg].begin(), ratio[cfg].end()));
+    }
     printf("  (Acceptance Criteria: N>=1024 >= 70%% Deemed to meet the standard.)\n");
+    printf("  (Judge acceptance on the [robust] median, not the single-shot [compare].)\n");
 
     CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_A));
