@@ -2,7 +2,7 @@
 
 A progressive CUDA GEMM (General Matrix Multiply) optimization project: starting with a single base compute kernel, five versions are developed—each introducing exactly one specific optimization technique—to demonstrate through quantifiable metrics "why" and "where" the performance improves at each step.   
     
-[project WIKI](https://github.com/HuajingLin/Explore-GPU-performance/wiki/Progressive-Performance-Matrix-on-GPU)   
+[project WIKI](https://github.com/HuajingLin/Explore-GPU-performance/wiki/V4-WMMA-GEMM)   
     
 ## Environment
 
@@ -36,32 +36,22 @@ bash bench/bench.sh       # Results are written to results/results.csv
 
 ## T4 Measured Data
 ```diff
-# V0 vs V1
-version,tile_size,N,   avg_ms, gflops
-V0,     NA,      1024, 6.114,  351.23
-V1,     32,      1024, 2.690,  798.25
-best speedup: 2.27x
-```
-```diff
-# V1 vs V2
-version,tile_size,N,   avg_ms, gflops
-V1,     32,      1024, 2.690,  798.25
-V2,     8*8,     1024, 1.193,  1799.68
-best speedup: 2.25x
-```
-```diff
-# V2 vs V3
-version,tile_size,N,    avg_ms, gflops
-V2,     8*8,      1024, 1.193,  1799.68
-V3,     8*8,      1024, 0.774,  2774.02
-best speedup: 1.54x
-```
-```diff
-# V3 vs V4
-version,tile_size,N,    avg_ms, gflops
-V3,     8*8,      1024, 0.774,  2774.02
-V4,     ,         1024, 0.897,  2393.46
-best speedup: 0.86x
+Step  Kernel                     % of cuBLAS
+ V0   naive                      ~9%
+ V1   shared_tiling              8.6–9.8%
+ V2   register_blocking          7.5–7.7%
+ V3   vectorized_dbuf            ~20%
+ V4   wmma_tensorcore            ~10%
+ V4.1 wmma_blocktile             67–69%
+ V4.2 wmma_blocktile             59%
+ V4.3 wmma_blocktile             69%
+ V4.4 wmma_blocktile             76–77%
+
+ N	    V4e-auto	Target 70%
+512	    76.5%	    (not in the target range)
+1024	76.0%	    ✓
+2048	70.0%	    at the threshold, not a reliable pass
+4096	82.3%	    ✓
 ```
 avg_time=
 
