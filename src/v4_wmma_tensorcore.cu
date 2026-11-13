@@ -1,13 +1,16 @@
 // v4_wmma_tensorcore.cu
 //
 // Build (Colab T4, sm_75):
-//   nvcc -O3 -std=c++17 -arch=sm_75 -Xptxas -v v4_wmma_tensorcore.cu -lcublas -o v4
+//   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
+//   cmake --build build -j
 // Run:
-//   ./v4 512     # verifies every kernel against the CPU reference
-//   ./v4 1024    # benchmark only (verification is skipped for N > 512)
-//   ./v4 2048
-//   ./v4 4096
-// In the -Xptxas -v output, check "spill stores" for wmma_blocktile_gemm_kernel.
+//   ./build/v4_wmma 512     # verifies every kernel against the CPU reference
+//   ./build/v4_wmma 1024    # benchmark only (verification skipped for N > 512)
+//   ./build/v4_wmma 2048
+//   ./build/v4_wmma 4096
+// Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
+// [compare] lines: T4 clocks/power state swing cuBLAS by up to ~40%.
+// The [attr] lines report regs / spills / smem / blocks-per-SM per config.
 
 #include "common.cuh"
 #include <cuda_fp16.h>
@@ -615,55 +618,60 @@ void print_v4e_attrs(const char* name) {
            attr.sharedSizeBytes, blocksPerSM);
 }
 
-// T4 sweep configs (40 SMs -> tile size decides wave count)
-//   V4e-128x128      : 8 warps of 64x32, BK=32  (~38 KB smem, 1 block/SM)
-//   V4e-128x64       : 4 warps of 64x32, BK=32
-//   V4e-64x64        : 4 warps of 32x32, BK=32
-//   V4e-128x128-w64  : 4 warps of 64x64, BK=32 (4x4 fragments per warp:
-//                      8 fragment loads feed 16 MMAs, vs 6 -> 8 in config A)
-//   V4e-w64-1stg     : as w64 with one smem buffer (~19 KB): 246 regs x 128
-//                      threads and 19 KB both allow 2 blocks/SM, so all 64
-//                      blocks at N=1024 are resident at once on 40 SMs
-//   V4e-128x128-1stg : as A with one smem buffer and __launch_bounds__(256,2)
-//                      (caps regs at 128 -> check spills)
-// Dropped after the T4 sweep: BK=16 variants (2 blocks/SM fit without spills
-// but were 8-45% slower than A -> blocks/SM was not the limiter).
-#define V4E_CFG_A 128, 128, 32, 64, 32
-#define V4E_CFG_B 128, 64, 32, 64, 32
-#define V4E_CFG_C 64, 64, 32, 32, 32
-#define V4E_CFG_D 128, 128, 32, 64, 64
-#define V4E_CFG_E 128, 128, 32, 64, 64, 1, 1
-#define V4E_CFG_F 128, 128, 32, 64, 32, 2, 1
-#define V4E_NUM_CFGS 6
-static const char* V4E_NAMES[V4E_NUM_CFGS] = {
-    "V4e-128x128", "V4e-128x64",     "V4e-64x64",
-    "V4e-128x128-w64", "V4e-w64-1stg", "V4e-128x128-1stg"};
+// ---------- V4e configs kept after the T4 sweep ----------
+//
+// Sweep history (Colab T4, robust median % of cuBLAS; see the write-up):
+//   128x128 (8 warps 64x32, 2 smem bufs, 1 block/SM) ......... 69% @1024
+//   128x128-k16 / -k16m2 (BK=16, 2 blocks/SM) ................ 59% @1024  (dropped)
+//   128x128-w64 (4 warps 64x64, 2 bufs, 1 block/SM) .......... 69% @1024  (dropped)
+//   128x128-1stg (8 warps, 1 buf, launch_bounds(256,2), spills) 70% @1024  (dropped)
+//   64x64 (4 warps 32x32) ..................................... 54% @1024  (dropped)
+// Kept:
+//   V4e-128x64   : 4 warps of 64x32, BK=32, 2 smem bufs. Best when the
+//                  128x128 grid has fewer blocks than SMs (N=512: 77.7%).
+//   V4e-w64-1stg : 128x128 tile, 4 warps of 64x64, BK=32, ONE smem buffer
+//                  (~19 KB). 254 regs x 128 threads and 19 KB both allow
+//                  2 blocks/SM. Best for N >= 1024 (76-77% @1024,
+//                  68-70% @2048, 82% @4096).
+//                  254 regs is 1 below the limit: re-check local(spill)
+//                  after ANY edit to the kernel.
+#define V4E_CFG_128x64 128, 64, 32, 64, 32
+#define V4E_CFG_W64_1STG 128, 128, 32, 64, 64, 1, 1
+#define V4E_NUM_CFGS 3
+static const char* V4E_NAMES[V4E_NUM_CFGS] = {"V4e-128x64", "V4e-w64-1stg",
+                                              "V4e-auto"};
 
 void print_all_v4e_attrs() {
-    print_v4e_attrs<V4E_CFG_A>(V4E_NAMES[0]);
-    print_v4e_attrs<V4E_CFG_B>(V4E_NAMES[1]);
-    print_v4e_attrs<V4E_CFG_C>(V4E_NAMES[2]);
-    print_v4e_attrs<V4E_CFG_D>(V4E_NAMES[3]);
-    print_v4e_attrs<V4E_CFG_E>(V4E_NAMES[4]);
-    print_v4e_attrs<V4E_CFG_F>(V4E_NAMES[5]);
+    print_v4e_attrs<V4E_CFG_128x64>(V4E_NAMES[0]);
+    print_v4e_attrs<V4E_CFG_W64_1STG>(V4E_NAMES[1]);
 }
 
-#define V4E_CASE(idx, CFG)                                              \
-    case idx:                                                           \
-        if (!v4e_shape_ok<CFG>(M, N, K)) return false;                  \
-        run_wmma_blocktile_gemm<CFG>(d_A, d_B, d_C, M, N, K);           \
-        return true;
+// Size-based dispatcher. The T4 has 40 SMs: if a 128x128 grid would give
+// fewer blocks than SMs, use the smaller 128x64 tile so every SM gets work.
+// Returns the config index (0 or 1), or -1 if neither shape fits.
+int v4e_auto_choice(int M, int N, int K) {
+    const int kNumSMs = 40;  // Tesla T4
+    bool w64_ok = v4e_shape_ok<V4E_CFG_W64_1STG>(M, N, K);
+    bool c64_ok = v4e_shape_ok<V4E_CFG_128x64>(M, N, K);
+    if (w64_ok && (M / 128) * (N / 128) >= kNumSMs) return 1;
+    if (c64_ok) return 0;
+    if (w64_ok) return 1;
+    return -1;
+}
 
 // Launch config `cfg` (0..V4E_NUM_CFGS-1). Returns false if the shape doesn't fit.
 bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
                  int N, int K) {
+    if (cfg == 2) cfg = v4e_auto_choice(M, N, K);
     switch (cfg) {
-        V4E_CASE(0, V4E_CFG_A)
-        V4E_CASE(1, V4E_CFG_B)
-        V4E_CASE(2, V4E_CFG_C)
-        V4E_CASE(3, V4E_CFG_D)
-        V4E_CASE(4, V4E_CFG_E)
-        V4E_CASE(5, V4E_CFG_F)
+        case 0:
+            if (!v4e_shape_ok<V4E_CFG_128x64>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_128x64>(d_A, d_B, d_C, M, N, K);
+            return true;
+        case 1:
+            if (!v4e_shape_ok<V4E_CFG_W64_1STG>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_W64_1STG>(d_A, d_B, d_C, M, N, K);
+            return true;
     }
     return false;
 }
@@ -686,6 +694,11 @@ int main(int argc, char** argv) {
     printf("=== V4 WMMA Tensor Core GEMM (FP16 input, FP32 accumulate) ===\n");
     printf("M=%d N=%d K=%d\n", M, N, K);
     print_all_v4e_attrs();
+    {
+        int c = v4e_auto_choice(M, N, K);
+        printf("  [auto] V4e-auto dispatches to: %s\n",
+               c >= 0 ? V4E_NAMES[c] : "(none: shape not supported)");
+    }
 
     if (M % WMMA_M != 0 || N % WMMA_N != 0 || K % WMMA_K != 0) {
         fprintf(stderr, "ERROR: M/N/K Must be divisible by 16.\n");
