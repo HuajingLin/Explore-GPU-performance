@@ -1,4 +1,13 @@
 // v4_wmma_tensorcore.cu
+//
+// Build (Colab T4, sm_75):
+//   nvcc -O3 -std=c++17 -arch=sm_75 -Xptxas -v v4_wmma_tensorcore.cu -lcublas -o v4
+// Run:
+//   ./v4 512     # verifies every kernel against the CPU reference
+//   ./v4 1024    # benchmark only (verification is skipped for N > 512)
+//   ./v4 2048
+//   ./v4 4096
+// In the -Xptxas -v output, check "spill stores" for wmma_blocktile_gemm_kernel.
 
 #include "common.cuh"
 #include <cuda_fp16.h>
@@ -398,6 +407,207 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
     wmma_warptile_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
 
+// ---------- V4e: Block tile + warp tile + padded smem + int4 loads + dbuf ----------
+//
+// Template parameters:
+//   BM x BN  : output tile per block
+//   BK       : K step per shared-memory stage (multiple of 16)
+//   WM x WN  : output tile per warp (multiples of 16)
+// Requirements: M % BM == 0, N % BN == 0, K % BK == 0.
+
+template <int BM, int BN, int BK, int WM, int WN>
+__global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32)
+wmma_blocktile_gemm_kernel(const half* __restrict__ A,
+                           const half* __restrict__ B,
+                           float* __restrict__ C, int M, int N, int K) {
+    constexpr int WARPS_N  = BN / WN;
+    constexpr int NTHREADS = (BM / WM) * WARPS_N * 32;
+    constexpr int FRAG_M   = WM / WMMA_M;
+    constexpr int FRAG_N   = WN / WMMA_N;
+
+    // +8 halves (16 B) of padding per row: ldm stays a multiple of 8 (WMMA
+    // requirement for half), and the 8 rows read by each ldmatrix land on
+    // 8 different 16-byte bank groups -> no bank conflicts.
+    constexpr int PAD   = 8;
+    constexpr int AS_LD = BK + PAD;
+    constexpr int BS_LD = BN + PAD;
+
+    // 16-byte vectors (8 halves)
+    constexpr int A_VECS_PER_ROW = BK / 8;
+    constexpr int B_VECS_PER_ROW = BN / 8;
+    constexpr int A_PER_T = (BM * BK / 8) / NTHREADS;
+    constexpr int B_PER_T = (BK * BN / 8) / NTHREADS;
+    static_assert((BM * BK / 8) % NTHREADS == 0, "A tile must split evenly");
+    static_assert((BK * BN / 8) % NTHREADS == 0, "B tile must split evenly");
+    static_assert(BK % WMMA_K == 0, "BK must be a multiple of 16");
+    static_assert(WM % WMMA_M == 0 && WN % WMMA_N == 0, "warp tile vs WMMA");
+
+    // load_matrix_sync needs 256-bit aligned pointers
+    __shared__ __align__(128) half As[2][BM * AS_LD];
+    __shared__ __align__(128) half Bs[2][BK * BS_LD];
+
+    const int tid     = threadIdx.x;
+    const int warpId  = tid / 32;
+    const int warpRow = warpId / WARPS_N;
+    const int warpCol = warpId % WARPS_N;
+
+    // blockIdx.x walks N so neighbouring blocks share the same A rows (L2 reuse)
+    const int blockRow = blockIdx.y * BM;
+    const int blockCol = blockIdx.x * BN;
+
+    const half* Ag = A + (size_t)blockRow * K;
+    const half* Bg = B + blockCol;
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major>
+        a_frag[FRAG_M];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major>
+        b_frag[FRAG_N];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
+        acc[FRAG_M][FRAG_N];
+
+#pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+#pragma unroll
+        for (int j = 0; j < FRAG_N; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    int4 ra[A_PER_T];
+    int4 rb[B_PER_T];
+
+    auto load_global = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            int r = idx / A_VECS_PER_ROW;
+            int c = (idx % A_VECS_PER_ROW) * 8;
+            ra[i] = *reinterpret_cast<const int4*>(Ag + (size_t)r * K + k0 + c);
+        }
+#pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            int r = idx / B_VECS_PER_ROW;
+            int c = (idx % B_VECS_PER_ROW) * 8;
+            rb[i] = *reinterpret_cast<const int4*>(Bg + (size_t)(k0 + r) * N + c);
+        }
+    };
+
+    auto store_shared = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < A_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            int r = idx / A_VECS_PER_ROW;
+            int c = (idx % A_VECS_PER_ROW) * 8;
+            *reinterpret_cast<int4*>(&As[buf][r * AS_LD + c]) = ra[i];
+        }
+#pragma unroll
+        for (int i = 0; i < B_PER_T; ++i) {
+            int idx = tid + i * NTHREADS;
+            int r = idx / B_VECS_PER_ROW;
+            int c = (idx % B_VECS_PER_ROW) * 8;
+            *reinterpret_cast<int4*>(&Bs[buf][r * BS_LD + c]) = rb[i];
+        }
+    };
+
+    // ---- prologue ----
+    load_global(0);
+    store_shared(0);
+    __syncthreads();
+
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool hasNext = (k0 + BK) < K;
+
+        // issue the next tile's global loads first; latency overlaps the MMAs
+        if (hasNext) load_global(k0 + BK);
+
+        const half* As_cur = As[buf];
+        const half* Bs_cur = Bs[buf];
+
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += WMMA_K) {
+#pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+                wmma::load_matrix_sync(
+                    a_frag[i], As_cur + (warpRow * WM + i * WMMA_M) * AS_LD + kk,
+                    AS_LD);
+#pragma unroll
+            for (int j = 0; j < FRAG_N; ++j)
+                wmma::load_matrix_sync(
+                    b_frag[j], Bs_cur + kk * BS_LD + warpCol * WN + j * WMMA_N,
+                    BS_LD);
+#pragma unroll
+            for (int i = 0; i < FRAG_M; ++i)
+#pragma unroll
+                for (int j = 0; j < FRAG_N; ++j)
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+        }
+
+        if (hasNext) {
+            // One barrier is enough: buf^1 was last read in the previous
+            // iteration, and every warp has already passed that barrier.
+            store_shared(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    // ---- epilogue ----
+#pragma unroll
+    for (int i = 0; i < FRAG_M; ++i)
+#pragma unroll
+        for (int j = 0; j < FRAG_N; ++j) {
+            int row = blockRow + warpRow * WM + i * WMMA_M;
+            int col = blockCol + warpCol * WN + j * WMMA_N;
+            wmma::store_matrix_sync(C + (size_t)row * N + col, acc[i][j], N,
+                                    wmma::mem_row_major);
+        }
+}
+
+template <int BM, int BN, int BK, int WM, int WN>
+bool v4e_shape_ok(int M, int N, int K) {
+    return (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+}
+
+template <int BM, int BN, int BK, int WM, int WN>
+void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
+                             int M, int N, int K) {
+    constexpr int NTHREADS = (BM / WM) * (BN / WN) * 32;
+    dim3 block(NTHREADS);
+    dim3 grid(N / BN, M / BM);
+    wmma_blocktile_gemm_kernel<BM, BN, BK, WM, WN>
+        <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+}
+
+// The three T4 sweep configs (40 SMs -> tile size decides wave count)
+//   V4e-128x128 : 8 warps of 64x32
+//   V4e-128x64  : 4 warps of 64x32
+//   V4e-64x64   : 4 warps of 32x32
+#define V4E_CFG_A 128, 128, 32, 64, 32
+#define V4E_CFG_B 128, 64, 32, 64, 32
+#define V4E_CFG_C 64, 64, 32, 32, 32
+#define V4E_NUM_CFGS 3
+static const char* V4E_NAMES[V4E_NUM_CFGS] = {"V4e-128x128", "V4e-128x64",
+                                              "V4e-64x64"};
+
+// Launch config `cfg` (0..2). Returns false if the shape doesn't fit.
+bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
+                 int N, int K) {
+    switch (cfg) {
+        case 0:
+            if (!v4e_shape_ok<V4E_CFG_A>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_A>(d_A, d_B, d_C, M, N, K);
+            return true;
+        case 1:
+            if (!v4e_shape_ok<V4E_CFG_B>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_B>(d_A, d_B, d_C, M, N, K);
+            return true;
+        case 2:
+            if (!v4e_shape_ok<V4E_CFG_C>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_C>(d_A, d_B, d_C, M, N, K);
+            return true;
+    }
+    return false;
+}
+
 // ---------- cuBLAS
 
 void run_cublas_gemm(cublasHandle_t handle, const half* d_A, const half* d_B,
@@ -440,6 +650,7 @@ int main(int argc, char** argv) {
     h_C_dbuf = (float*)malloc(size_C * sizeof(float));
     h_C_warptile = (float*)malloc(size_C * sizeof(float));
     h_C_cublas = (float*)malloc(size_C * sizeof(float));
+    float* h_C_v4e = (float*)malloc(size_C * sizeof(float));
 
     init_matrix(h_A_f32, M, K, 42);
     init_matrix(h_B_f32, K, N, 24);
@@ -460,6 +671,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_C_dbuf, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_warptile, size_C * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_C_cublas, size_C * sizeof(float)));
+    float* d_C_v4e;
+    CUDA_CHECK(cudaMalloc(&d_C_v4e, size_C * sizeof(float)));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_A_f16, size_A * sizeof(half),
                            cudaMemcpyHostToDevice));
@@ -495,6 +708,22 @@ int main(int argc, char** argv) {
                                size_C * sizeof(float), cudaMemcpyDeviceToHost));
         printf("  [verify warptile wmma kernel]\n");
         verify_result(h_C_warptile, h_C_ref, (int)size_C, 0.5f, 0.05f);
+
+        for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+            // clear first so stale results from a previous config can't pass
+            CUDA_CHECK(cudaMemset(d_C_v4e, 0, size_C * sizeof(float)));
+            if (!run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K)) {
+                printf("  [verify %s] skipped (shape not divisible)\n",
+                       V4E_NAMES[cfg]);
+                continue;
+            }
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(h_C_v4e, d_C_v4e, size_C * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            printf("  [verify %s]\n", V4E_NAMES[cfg]);
+            verify_result(h_C_v4e, h_C_ref, (int)size_C, 0.5f, 0.05f);
+        }
 
         free(h_C_ref);
     } else {
@@ -535,6 +764,23 @@ int main(int argc, char** argv) {
     printf("  [compare] warptile over tiled promote: %.2fx\n",
            gflops_warptile / gflops_tiled);
 
+    // ---------- Benchmark: V4e tile sweep ----------
+    double gflops_v4e[V4E_NUM_CFGS] = {0.0, 0.0, 0.0};
+    for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+        if (!run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K)) {
+            printf("  [bench] %s: skipped (shape not divisible)\n",
+                   V4E_NAMES[cfg]);
+            continue;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        float ms = benchmark_kernel(
+            [&]() { run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K); });
+        gflops_v4e[cfg] = compute_gflops(M, N, K, ms);
+        printf("  [bench] %s WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
+               V4E_NAMES[cfg], ms, gflops_v4e[cfg]);
+    }
+
     // ---------- Benchmark: cuBLAS run Tensor Core----------
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
@@ -554,6 +800,19 @@ int main(int argc, char** argv) {
     printf("  [compare] tiled kernel achieving cuBLAS performance %.1f%%\n", pct_tiled);
     printf("  [compare] tiled+dbuf kernel achieving cuBLAS performance %.1f%%\n", pct_dbuf);
     printf("  [compare] warptile kernel achieving cuBLAS performance %.1f%%\n", pct_warptile);
+
+    int best_cfg = -1;
+    for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+        if (gflops_v4e[cfg] <= 0.0) continue;
+        printf("  [compare] %s kernel achieving cuBLAS performance %.1f%% "
+               "(%.2fx over tiled)\n",
+               V4E_NAMES[cfg], 100.0 * gflops_v4e[cfg] / gflops_cublas,
+               gflops_v4e[cfg] / gflops_tiled);
+        if (best_cfg < 0 || gflops_v4e[cfg] > gflops_v4e[best_cfg]) best_cfg = cfg;
+    }
+    if (best_cfg >= 0)
+        printf("  [sweep] best V4e config at N=%d: %s (%.1f%% of cuBLAS)\n", N,
+               V4E_NAMES[best_cfg], 100.0 * gflops_v4e[best_cfg] / gflops_cublas);
     printf("  (Acceptance Criteria: N>=1024 >= 70%% Deemed to meet the standard.)\n");
 
     CUBLAS_CHECK(cublasDestroy(handle));
@@ -564,6 +823,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_C_dbuf));
     CUDA_CHECK(cudaFree(d_C_warptile));
     CUDA_CHECK(cudaFree(d_C_cublas));
+    CUDA_CHECK(cudaFree(d_C_v4e));
+    free(h_C_v4e);
     free(h_A_f32);
     free(h_B_f32);
     free(h_A_f16);
