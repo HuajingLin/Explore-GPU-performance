@@ -410,100 +410,100 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
 // ---------- V4e: Block tile + warp tile + padded smem + int4 loads + dbuf ----------
 //
 // Template parameters:
-//   BM x BN  : output tile per block
-//   BK       : K step per shared-memory stage (multiple of 16)
-//   WM x WN  : output tile per warp (multiples of 16)
-// Requirements: M % BM == 0, N % BN == 0, K % BK == 0.
+//   kBM x kBN  : output tile per block
+//   kBK       : K step per shared-memory stage (multiple of 16)
+//   kWM x kWN  : output tile per warp (multiples of 16)
+// Requirements: M % kBM == 0, N % kBN == 0, K % kBK == 0.
 
-template <int BM, int BN, int BK, int WM, int WN>
-__global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32)
+template <int kBM, int kBN, int kBK, int kWM, int kWN>
+__global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32)
 wmma_blocktile_gemm_kernel(const half* __restrict__ A,
                            const half* __restrict__ B,
                            float* __restrict__ C, int M, int N, int K) {
-    constexpr int WARPS_N  = BN / WN;
-    constexpr int NTHREADS = (BM / WM) * WARPS_N * 32;
-    constexpr int FRAG_M   = WM / WMMA_M;
-    constexpr int FRAG_N   = WN / WMMA_N;
+    constexpr int kWarpsN  = kBN / kWN;
+    constexpr int kThreads = (kBM / kWM) * kWarpsN * 32;
+    constexpr int kFragM   = kWM / WMMA_M;
+    constexpr int kFragN   = kWN / WMMA_N;
 
     // +8 halves (16 B) of padding per row: ldm stays a multiple of 8 (WMMA
     // requirement for half), and the 8 rows read by each ldmatrix land on
     // 8 different 16-byte bank groups -> no bank conflicts.
-    constexpr int PAD   = 8;
-    constexpr int AS_LD = BK + PAD;
-    constexpr int BS_LD = BN + PAD;
+    constexpr int kPad   = 8;
+    constexpr int kAsLd = kBK + kPad;
+    constexpr int kBsLd = kBN + kPad;
 
     // 16-byte vectors (8 halves)
-    constexpr int A_VECS_PER_ROW = BK / 8;
-    constexpr int B_VECS_PER_ROW = BN / 8;
-    constexpr int A_PER_T = (BM * BK / 8) / NTHREADS;
-    constexpr int B_PER_T = (BK * BN / 8) / NTHREADS;
-    static_assert((BM * BK / 8) % NTHREADS == 0, "A tile must split evenly");
-    static_assert((BK * BN / 8) % NTHREADS == 0, "B tile must split evenly");
-    static_assert(BK % WMMA_K == 0, "BK must be a multiple of 16");
-    static_assert(WM % WMMA_M == 0 && WN % WMMA_N == 0, "warp tile vs WMMA");
+    constexpr int kAVecsPerRow = kBK / 8;
+    constexpr int kBVecsPerRow = kBN / 8;
+    constexpr int kAPerT = (kBM * kBK / 8) / kThreads;
+    constexpr int kBPerT = (kBK * kBN / 8) / kThreads;
+    static_assert((kBM * kBK / 8) % kThreads == 0, "A tile must split evenly");
+    static_assert((kBK * kBN / 8) % kThreads == 0, "B tile must split evenly");
+    static_assert(kBK % WMMA_K == 0, "kBK must be a multiple of 16");
+    static_assert(kWM % WMMA_M == 0 && kWN % WMMA_N == 0, "warp tile vs WMMA");
 
     // load_matrix_sync needs 256-bit aligned pointers
-    __shared__ __align__(128) half As[2][BM * AS_LD];
-    __shared__ __align__(128) half Bs[2][BK * BS_LD];
+    __shared__ __align__(128) half As[2][kBM * kAsLd];
+    __shared__ __align__(128) half Bs[2][kBK * kBsLd];
 
     const int tid     = threadIdx.x;
     const int warpId  = tid / 32;
-    const int warpRow = warpId / WARPS_N;
-    const int warpCol = warpId % WARPS_N;
+    const int warpRow = warpId / kWarpsN;
+    const int warpCol = warpId % kWarpsN;
 
     // blockIdx.x walks N so neighbouring blocks share the same A rows (L2 reuse)
-    const int blockRow = blockIdx.y * BM;
-    const int blockCol = blockIdx.x * BN;
+    const int blockRow = blockIdx.y * kBM;
+    const int blockCol = blockIdx.x * kBN;
 
     const half* Ag = A + (size_t)blockRow * K;
     const half* Bg = B + blockCol;
 
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major>
-        a_frag[FRAG_M];
+        a_frag[kFragM];
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major>
-        b_frag[FRAG_N];
+        b_frag[kFragN];
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
-        acc[FRAG_M][FRAG_N];
+        acc[kFragM][kFragN];
 
 #pragma unroll
-    for (int i = 0; i < FRAG_M; ++i)
+    for (int i = 0; i < kFragM; ++i)
 #pragma unroll
-        for (int j = 0; j < FRAG_N; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+        for (int j = 0; j < kFragN; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
 
-    int4 ra[A_PER_T];
-    int4 rb[B_PER_T];
+    int4 ra[kAPerT];
+    int4 rb[kBPerT];
 
     auto load_global = [&](int k0) {
 #pragma unroll
-        for (int i = 0; i < A_PER_T; ++i) {
-            int idx = tid + i * NTHREADS;
-            int r = idx / A_VECS_PER_ROW;
-            int c = (idx % A_VECS_PER_ROW) * 8;
+        for (int i = 0; i < kAPerT; ++i) {
+            int idx = tid + i * kThreads;
+            int r = idx / kAVecsPerRow;
+            int c = (idx % kAVecsPerRow) * 8;
             ra[i] = *reinterpret_cast<const int4*>(Ag + (size_t)r * K + k0 + c);
         }
 #pragma unroll
-        for (int i = 0; i < B_PER_T; ++i) {
-            int idx = tid + i * NTHREADS;
-            int r = idx / B_VECS_PER_ROW;
-            int c = (idx % B_VECS_PER_ROW) * 8;
+        for (int i = 0; i < kBPerT; ++i) {
+            int idx = tid + i * kThreads;
+            int r = idx / kBVecsPerRow;
+            int c = (idx % kBVecsPerRow) * 8;
             rb[i] = *reinterpret_cast<const int4*>(Bg + (size_t)(k0 + r) * N + c);
         }
     };
 
     auto store_shared = [&](int buf) {
 #pragma unroll
-        for (int i = 0; i < A_PER_T; ++i) {
-            int idx = tid + i * NTHREADS;
-            int r = idx / A_VECS_PER_ROW;
-            int c = (idx % A_VECS_PER_ROW) * 8;
-            *reinterpret_cast<int4*>(&As[buf][r * AS_LD + c]) = ra[i];
+        for (int i = 0; i < kAPerT; ++i) {
+            int idx = tid + i * kThreads;
+            int r = idx / kAVecsPerRow;
+            int c = (idx % kAVecsPerRow) * 8;
+            *reinterpret_cast<int4*>(&As[buf][r * kAsLd + c]) = ra[i];
         }
 #pragma unroll
-        for (int i = 0; i < B_PER_T; ++i) {
-            int idx = tid + i * NTHREADS;
-            int r = idx / B_VECS_PER_ROW;
-            int c = (idx % B_VECS_PER_ROW) * 8;
-            *reinterpret_cast<int4*>(&Bs[buf][r * BS_LD + c]) = rb[i];
+        for (int i = 0; i < kBPerT; ++i) {
+            int idx = tid + i * kThreads;
+            int r = idx / kBVecsPerRow;
+            int c = (idx % kBVecsPerRow) * 8;
+            *reinterpret_cast<int4*>(&Bs[buf][r * kBsLd + c]) = rb[i];
         }
     };
 
@@ -513,31 +513,31 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
     __syncthreads();
 
     int buf = 0;
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        const bool hasNext = (k0 + BK) < K;
+    for (int k0 = 0; k0 < K; k0 += kBK) {
+        const bool hasNext = (k0 + kBK) < K;
 
         // issue the next tile's global loads first; latency overlaps the MMAs
-        if (hasNext) load_global(k0 + BK);
+        if (hasNext) load_global(k0 + kBK);
 
         const half* As_cur = As[buf];
         const half* Bs_cur = Bs[buf];
 
 #pragma unroll
-        for (int kk = 0; kk < BK; kk += WMMA_K) {
+        for (int kk = 0; kk < kBK; kk += WMMA_K) {
 #pragma unroll
-            for (int i = 0; i < FRAG_M; ++i)
+            for (int i = 0; i < kFragM; ++i)
                 wmma::load_matrix_sync(
-                    a_frag[i], As_cur + (warpRow * WM + i * WMMA_M) * AS_LD + kk,
-                    AS_LD);
+                    a_frag[i], As_cur + (warpRow * kWM + i * WMMA_M) * kAsLd + kk,
+                    kAsLd);
 #pragma unroll
-            for (int j = 0; j < FRAG_N; ++j)
+            for (int j = 0; j < kFragN; ++j)
                 wmma::load_matrix_sync(
-                    b_frag[j], Bs_cur + kk * BS_LD + warpCol * WN + j * WMMA_N,
-                    BS_LD);
+                    b_frag[j], Bs_cur + kk * kBsLd + warpCol * kWN + j * WMMA_N,
+                    kBsLd);
 #pragma unroll
-            for (int i = 0; i < FRAG_M; ++i)
+            for (int i = 0; i < kFragM; ++i)
 #pragma unroll
-                for (int j = 0; j < FRAG_N; ++j)
+                for (int j = 0; j < kFragN; ++j)
                     wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
 
@@ -552,28 +552,28 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
 
     // ---- epilogue ----
 #pragma unroll
-    for (int i = 0; i < FRAG_M; ++i)
+    for (int i = 0; i < kFragM; ++i)
 #pragma unroll
-        for (int j = 0; j < FRAG_N; ++j) {
-            int row = blockRow + warpRow * WM + i * WMMA_M;
-            int col = blockCol + warpCol * WN + j * WMMA_N;
+        for (int j = 0; j < kFragN; ++j) {
+            int row = blockRow + warpRow * kWM + i * WMMA_M;
+            int col = blockCol + warpCol * kWN + j * WMMA_N;
             wmma::store_matrix_sync(C + (size_t)row * N + col, acc[i][j], N,
                                     wmma::mem_row_major);
         }
 }
 
-template <int BM, int BN, int BK, int WM, int WN>
+template <int kBM, int kBN, int kBK, int kWM, int kWN>
 bool v4e_shape_ok(int M, int N, int K) {
-    return (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+    return (M % kBM == 0) && (N % kBN == 0) && (K % kBK == 0);
 }
 
-template <int BM, int BN, int BK, int WM, int WN>
+template <int kBM, int kBN, int kBK, int kWM, int kWN>
 void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
-    constexpr int NTHREADS = (BM / WM) * (BN / WN) * 32;
-    dim3 block(NTHREADS);
-    dim3 grid(N / BN, M / BM);
-    wmma_blocktile_gemm_kernel<BM, BN, BK, WM, WN>
+    constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
+    dim3 block(kThreads);
+    dim3 grid(N / kBN, M / kBM);
+    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN>
         <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
 }
 
