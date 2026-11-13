@@ -419,7 +419,12 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
 
 // kMinBlocks > 1 asks the compiler to fit that many blocks per SM, which caps
 // registers per thread (65536 / (threads * kMinBlocks)); watch for spills.
-template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+// kStages = 2: two shared-memory buffers, one barrier per K step.
+// kStages = 1: one shared-memory buffer (half the smem), two barriers per K
+//              step. The next tile is still prefetched into registers, so
+//              global-load latency is still overlapped with the MMAs.
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
+          int kStages = 2>
 __global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32, kMinBlocks)
 wmma_blocktile_gemm_kernel(const half* __restrict__ A,
                            const half* __restrict__ B,
@@ -447,8 +452,9 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
     static_assert(kWM % WMMA_M == 0 && kWN % WMMA_N == 0, "warp tile vs WMMA");
 
     // load_matrix_sync needs 256-bit aligned pointers
-    __shared__ __align__(128) half As[2][kBM * kAsLd];
-    __shared__ __align__(128) half Bs[2][kBK * kBsLd];
+    static_assert(kStages == 1 || kStages == 2, "kStages must be 1 or 2");
+    __shared__ __align__(128) half As[kStages][kBM * kAsLd];
+    __shared__ __align__(128) half Bs[kStages][kBK * kBsLd];
 
     const int tid     = threadIdx.x;
     const int warpId  = tid / 32;
@@ -546,11 +552,19 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
         }
 
         if (hasNext) {
-            // One barrier is enough: buf^1 was last read in the previous
-            // iteration, and every warp has already passed that barrier.
-            store_shared(buf ^ 1);
-            __syncthreads();
-            buf ^= 1;
+            if (kStages == 2) {
+                // One barrier is enough: buf^1 was last read in the previous
+                // iteration, and every warp has already passed that barrier.
+                store_shared(buf ^ 1);
+                __syncthreads();
+                buf ^= 1;
+            } else {
+                // Single buffer: wait until every warp is done reading it,
+                // overwrite it from the prefetch registers, wait again.
+                __syncthreads();
+                store_shared(0);
+                __syncthreads();
+            }
         }
     }
 
@@ -566,26 +580,29 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
         }
 }
 
-template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
+          int kStages = 2>
 bool v4e_shape_ok(int M, int N, int K) {
     return (M % kBM == 0) && (N % kBN == 0) && (K % kBK == 0);
 }
 
-template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
+          int kStages = 2>
 void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
     dim3 block(kThreads);
     dim3 grid(N / kBN, M / kBM);
-    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks>
+    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages>
         <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
 }
 
 // Prints registers, local memory (spills), static smem and how many blocks
 // fit per SM, as reported by the runtime for the compiled kernel.
-template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1>
+template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
+          int kStages = 2>
 void print_v4e_attrs(const char* name) {
-    auto kern = wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks>;
+    auto kern = wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages>;
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
     cudaFuncAttributes attr;
     CUDA_CHECK(cudaFuncGetAttributes(&attr, kern));
@@ -604,21 +621,31 @@ void print_v4e_attrs(const char* name) {
 //   V4e-64x64        : 4 warps of 32x32, BK=32
 //   V4e-128x128-w64  : 4 warps of 64x64, BK=32 (4x4 fragments per warp:
 //                      8 fragment loads feed 16 MMAs, vs 6 -> 8 in config A)
+//   V4e-w64-1stg     : as w64 with one smem buffer (~19 KB): 246 regs x 128
+//                      threads and 19 KB both allow 2 blocks/SM, so all 64
+//                      blocks at N=1024 are resident at once on 40 SMs
+//   V4e-128x128-1stg : as A with one smem buffer and __launch_bounds__(256,2)
+//                      (caps regs at 128 -> check spills)
 // Dropped after the T4 sweep: BK=16 variants (2 blocks/SM fit without spills
 // but were 8-45% slower than A -> blocks/SM was not the limiter).
 #define V4E_CFG_A 128, 128, 32, 64, 32
 #define V4E_CFG_B 128, 64, 32, 64, 32
 #define V4E_CFG_C 64, 64, 32, 32, 32
 #define V4E_CFG_D 128, 128, 32, 64, 64
-#define V4E_NUM_CFGS 4
+#define V4E_CFG_E 128, 128, 32, 64, 64, 1, 1
+#define V4E_CFG_F 128, 128, 32, 64, 32, 2, 1
+#define V4E_NUM_CFGS 6
 static const char* V4E_NAMES[V4E_NUM_CFGS] = {
-    "V4e-128x128", "V4e-128x64", "V4e-64x64", "V4e-128x128-w64"};
+    "V4e-128x128", "V4e-128x64",     "V4e-64x64",
+    "V4e-128x128-w64", "V4e-w64-1stg", "V4e-128x128-1stg"};
 
 void print_all_v4e_attrs() {
     print_v4e_attrs<V4E_CFG_A>(V4E_NAMES[0]);
     print_v4e_attrs<V4E_CFG_B>(V4E_NAMES[1]);
     print_v4e_attrs<V4E_CFG_C>(V4E_NAMES[2]);
     print_v4e_attrs<V4E_CFG_D>(V4E_NAMES[3]);
+    print_v4e_attrs<V4E_CFG_E>(V4E_NAMES[4]);
+    print_v4e_attrs<V4E_CFG_F>(V4E_NAMES[5]);
 }
 
 #define V4E_CASE(idx, CFG)                                              \
@@ -635,6 +662,8 @@ bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
         V4E_CASE(1, V4E_CFG_B)
         V4E_CASE(2, V4E_CFG_C)
         V4E_CASE(3, V4E_CFG_D)
+        V4E_CASE(4, V4E_CFG_E)
+        V4E_CASE(5, V4E_CFG_F)
     }
     return false;
 }
