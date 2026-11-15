@@ -47,13 +47,13 @@ Step  Kernel                     % of cuBLAS
  V4.3 wmma_blocktile             69%
  V4.4 wmma_blocktile             76–77%
 
- N      V4e-auto    Target 70%
-512     76.5%       (not in the target range)
-1024    76.0%       ✓
-2048    70.0%       at the threshold, not a reliable pass
-4096    82.3%       ✓
+Final result
+N	    Configuration	% of cuBLAS        ≥ 70%
+512	    V4e-128x64	    77.6%	           (not in the target range)
+1024	V4e-w64-sprd	77.2%	           ✓
+2048	V4e-w64-sprd	72.0%	           ✓
+4096	V4e-w64-sprd	80.3%	           ✓
 ```
-avg_time=
 
 ## Project layout
 ```
