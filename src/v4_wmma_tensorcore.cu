@@ -4,8 +4,8 @@
 //   cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
 //   cmake --build build -j
 // Run:
-//   ./build/v4_wmma 512     # verifies every kernel against the CPU reference
-//   ./build/v4_wmma 1024    # benchmark only (verification skipped for N > 512)
+//   ./build/v4_wmma 512     # verifies every kernel vs the CPU reference AND cuBLAS
+//   ./build/v4_wmma 1024    # N > 512: every kernel is verified against cuBLAS only
 //   ./build/v4_wmma 2048
 //   ./build/v4_wmma 4096
 // Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
@@ -34,6 +34,50 @@ using namespace nvcuda;
             exit(EXIT_FAILURE);                                            \
         }                                                                   \
     } while (0)
+
+// ---------- verification tolerances ----------
+// Both references (CPU GEMM and cuBLAS) see exactly the same FP16-rounded
+// inputs as the kernels, so the only remaining difference is FP32 summation
+// order. That lets the tolerance be ~50x tighter than the old 0.5 / 5%,
+// tight enough that a single dropped 16-wide K step fails.
+// If verify_result reports failures on kernels you trust (it lives in
+// common.cuh), loosen these a little rather than going back to 0.5 / 5%.
+static const float kVerifyAtol = 1e-2f;
+static const float kVerifyRtol = 1e-3f;
+
+// Abort unless (M, N, K) is an exact multiple of the kernel's block shape.
+// None of the kernels in this file handle partial tiles: a ragged edge
+// would make load_matrix_sync / store_matrix_sync touch out-of-bounds memory.
+static void require_shape(const char* name, int M, int N, int K, int bm,
+                          int bn, int bk) {
+    if (M <= 0 || N <= 0 || K <= 0 || M % bm != 0 || N % bn != 0 ||
+        K % bk != 0) {
+        fprintf(stderr,
+                "ERROR [%s]: M=%d N=%d K=%d must be positive multiples of "
+                "%d / %d / %d\n",
+                name, M, N, K, bm, bn, bk);
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Number of SMs on the current device (40 on a Tesla T4), queried once.
+static int device_num_sms() {
+    static int cached = 0;
+    if (cached == 0) {
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(
+            &cached, cudaDevAttrMultiProcessorCount, dev));
+    }
+    return cached;
+}
+
+// ---------- FP16 back to FP32 (host), for the CPU reference ----------
+void convert_to_float(const half* src, float* dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = __half2float(src[i]);
+    }
+}
 
 // ---------- FP32matrix to FP16 (host)----------
 void convert_to_half(const float* src, half* dst, size_t n) {
@@ -77,9 +121,10 @@ __global__ void wmma_naive_gemm_kernel(const half* __restrict__ A,
 void run_wmma_gemm(const half* d_A, const half* d_B, float* d_C, int M,
                     int N, int K) {
     dim3 blockDim(128, 4);
-    dim3 gridDim((M + (WMMA_M * (blockDim.x / 32)) - 1) /
-                     (WMMA_M * (blockDim.x / 32)),
-                 (N + (WMMA_N * blockDim.y) - 1) / (WMMA_N * blockDim.y));
+    const int blockM = WMMA_M * (blockDim.x / 32);  // 4 warps along M -> 64 rows
+    const int blockN = WMMA_N * blockDim.y;         // 4 warps along N -> 64 cols
+    require_shape("naive WMMA", M, N, K, blockM, blockN, WMMA_K);
+    dim3 gridDim(M / blockM, N / blockN);
     wmma_naive_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
 
@@ -158,6 +203,7 @@ __global__ void wmma_tiled_gemm_kernel(const half* __restrict__ A,
 void run_wmma_tiled_gemm(const half* d_A, const half* d_B, float* d_C, int M,
                           int N, int K) {
     dim3 blockDim(128, 4);
+    require_shape("tiled WMMA", M, N, K, TILE_M, TILE_N, TILE_K);
     dim3 gridDim(M / TILE_M, N / TILE_N);
     wmma_tiled_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
@@ -279,14 +325,24 @@ __global__ void wmma_tiled_dbuf_gemm_kernel(const half* __restrict__ A,
 void run_wmma_tiled_dbuf_gemm(const half* d_A, const half* d_B, float* d_C,
                                int M, int N, int K) {
     dim3 blockDim(128, 4);
+    require_shape("tiled+dbuf WMMA", M, N, K, TILE_M, TILE_N, TILE_K);
     dim3 gridDim(M / TILE_M, N / TILE_N);
     wmma_tiled_dbuf_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
 
+// ---------- V4c: Shared Memory Tiling + warp-level multi-fragment tiling ----------
+//
+// Each warp owns a (WARP_TILE_M*16) x (WARP_TILE_N*16) = 64x32 output region,
+// i.e. 4x2 = 8 accumulator fragments. With a 64x64 block tile that means
+// 1 warp along M and 2 warps along N: 2 warps = 64 threads per block.
 #define WARP_TILE_M 4  // number of WMMA_M tiles each warp computes, M direction
 #define WARP_TILE_N 2  // number of WMMA_N tiles each warp computes, N direction
-#define WARPS_M (TILE_M / (WARP_TILE_M * WMMA_M))  // = 64/32 = 2 warps along M
+#define WARPS_M (TILE_M / (WARP_TILE_M * WMMA_M))  // = 64/64 = 1 warp along M
 #define WARPS_N (TILE_N / (WARP_TILE_N * WMMA_N))  // = 64/32 = 2 warps along N
+static_assert(WARPS_M >= 1 && WARPS_M * WARP_TILE_M * WMMA_M == TILE_M,
+              "warp tiles must exactly cover TILE_M");
+static_assert(WARPS_N >= 1 && WARPS_N * WARP_TILE_N * WMMA_N == TILE_N,
+              "warp tiles must exactly cover TILE_N");
 
 __global__ void wmma_warptile_gemm_kernel(const half* __restrict__ A,
                                            const half* __restrict__ B,
@@ -296,13 +352,13 @@ __global__ void wmma_warptile_gemm_kernel(const half* __restrict__ A,
     int cCol = blockIdx.y;  // block's N-direction tile index
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;  // flattened thread id within block
-    int totalThreads = blockDim.x * blockDim.y;         // 128 for this kernel
+    int totalThreads = blockDim.x * blockDim.y;         // WARPS_M*WARPS_N*32 = 64
 
-    int warpM_local = threadIdx.x / warpSize;  // 0..WARPS_M-1 (0..1)
+    int warpM_local = threadIdx.x / warpSize;  // 0..WARPS_M-1 (always 0)
     int warpN_local = threadIdx.y;             // 0..WARPS_N-1 (0..1)
 
     // This warp's output region, in local (block-relative) coordinates
-    int warpRowBase = warpM_local * WARP_TILE_M * WMMA_M;  // 0 or 32
+    int warpRowBase = warpM_local * WARP_TILE_M * WMMA_M;  // always 0
     int warpColBase = warpN_local * WARP_TILE_N * WMMA_N;  // 0 or 32
 
     // This warp's output region, in global matrix coordinates
@@ -351,8 +407,8 @@ __global__ void wmma_warptile_gemm_kernel(const half* __restrict__ A,
 
         // ---- each warp loads its WARP_TILE_M a_frags and WARP_TILE_N
         // b_frags once, then reuses them across the WARP_TILE_M x
-        // WARP_TILE_N cross-product of mma_sync calls (this is exactly
-        // the "1:1 load:compute ratio" described above) ----
+        // WARP_TILE_N cross-product of mma_sync calls: 4 + 2 = 6 fragment
+        // loads feed 8 MMAs, versus 2 loads per MMA in V4b ----
         if (aRowBase < M && bColBase < N) {
 #pragma unroll
             for (int kk = 0; kk < TILE_K; kk += WMMA_K) {
@@ -403,11 +459,12 @@ __global__ void wmma_warptile_gemm_kernel(const half* __restrict__ A,
 
 void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
-    // blockDim: WARPS_M*32 threads along x (2 warps x 32 = 64), WARPS_N
-    // along y (2) -> 128 threads = 4 warps per block, covering the same
-    // TILE_M x TILE_N = 64x64 output region as V4b/c/d, just with fewer,
-    // "fatter" warps instead of 16 "thin" ones.
+    // blockDim: WARPS_M*32 threads along x (1 warp x 32 = 32), WARPS_N
+    // along y (2) -> 64 threads = 2 warps per block, covering the same
+    // TILE_M x TILE_N = 64x64 output region as V4b/V4d, just with 2 "fat"
+    // warps (64x32 each) instead of 16 "thin" ones (16x16 each).
     dim3 blockDim(WARPS_M * 32, WARPS_N);
+    require_shape("warptile WMMA", M, N, K, TILE_M, TILE_N, TILE_K);
     dim3 gridDim(M / TILE_M, N / TILE_N);
     wmma_warptile_gemm_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
 }
@@ -594,6 +651,7 @@ template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
 void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
+    require_shape("V4e", M, N, K, kBM, kBN, kBK);
     dim3 block(kThreads);
     dim3 grid(N / kBN, M / kBM);
     wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages>
@@ -646,11 +704,12 @@ void print_all_v4e_attrs() {
     print_v4e_attrs<V4E_CFG_W64_1STG>(V4E_NAMES[1]);
 }
 
-// Size-based dispatcher. The T4 has 40 SMs: if a 128x128 grid would give
-// fewer blocks than SMs, use the smaller 128x64 tile so every SM gets work.
+// Size-based dispatcher. If a 128x128 grid would give fewer blocks than the
+// device has SMs (40 on a T4; queried at runtime), use the smaller 128x64
+// tile so every SM gets work.
 // Returns the config index (0 or 1), or -1 if neither shape fits.
 int v4e_auto_choice(int M, int N, int K) {
-    const int kNumSMs = 40;  // Tesla T4
+    const int kNumSMs = device_num_sms();
     bool w64_ok = v4e_shape_ok<V4E_CFG_W64_1STG>(M, N, K);
     bool c64_ok = v4e_shape_ok<V4E_CFG_128x64>(M, N, K);
     if (w64_ok && (M / 128) * (N / 128) >= kNumSMs) return 1;
@@ -754,59 +813,88 @@ int main(int argc, char** argv) {
                            cudaMemcpyHostToDevice));
 
     // ---------- verify ----------
+    // Two references, both built from the SAME FP16-rounded inputs the
+    // kernels see, so only FP32 summation order differs:
+    //   (a) cuBLAS, for every N (cheap: one GEMM on the GPU);
+    //   (b) CPU GEMM, for N <= 512 only (O(N^3) on the host). It also
+    //       cross-checks cuBLAS itself, so (a) is not trusted blindly.
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_C_cublas, d_C_cublas, size_C * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    printf("  [verify] tolerances: atol=%g rtol=%g\n", kVerifyAtol,
+           kVerifyRtol);
+    float* h_C_ref = nullptr;
     if (N <= 512) {
-        run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K);
-        CUDA_CHECK(cudaMemcpy(h_C_wmma, d_C_wmma, size_C * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-
-        float* h_C_ref = (float*)malloc(size_C * sizeof(float));
-        cpu_gemm_ref(h_A_f32, h_B_f32, h_C_ref, M, N, K);
-
-        printf("  [verify naive wmma kernel] (FP16 atol=0.5/rtol=5%%)\n");
-        verify_result(h_C_wmma, h_C_ref, (int)size_C, 0.5f, 0.05f);
-
-        run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K);
-        CUDA_CHECK(cudaMemcpy(h_C_tiled, d_C_tiled, size_C * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-        printf("  [verify tiled wmma kernel]\n");
-        verify_result(h_C_tiled, h_C_ref, (int)size_C, 0.5f, 0.05f);
-
-        run_wmma_tiled_dbuf_gemm(d_A, d_B, d_C_dbuf, M, N, K);
-        CUDA_CHECK(cudaMemcpy(h_C_dbuf, d_C_dbuf, size_C * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-        printf("  [verify tiled+dbuf wmma kernel]\n");
-        verify_result(h_C_dbuf, h_C_ref, (int)size_C, 0.5f, 0.05f);
-
-        run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K);
-        CUDA_CHECK(cudaMemcpy(h_C_warptile, d_C_warptile,
-                               size_C * sizeof(float), cudaMemcpyDeviceToHost));
-        printf("  [verify warptile wmma kernel]\n");
-        verify_result(h_C_warptile, h_C_ref, (int)size_C, 0.5f, 0.05f);
-
-        for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
-            // clear first so stale results from a previous config can't pass
-            CUDA_CHECK(cudaMemset(d_C_v4e, 0, size_C * sizeof(float)));
-            if (!run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K)) {
-                printf("  [verify %s] skipped (shape not divisible)\n",
-                       V4E_NAMES[cfg]);
-                continue;
-            }
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaMemcpy(h_C_v4e, d_C_v4e, size_C * sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-            printf("  [verify %s]\n", V4E_NAMES[cfg]);
-            verify_result(h_C_v4e, h_C_ref, (int)size_C, 0.5f, 0.05f);
-        }
-
-        free(h_C_ref);
+        float* h_A_q = (float*)malloc(size_A * sizeof(float));
+        float* h_B_q = (float*)malloc(size_B * sizeof(float));
+        h_C_ref = (float*)malloc(size_C * sizeof(float));
+        convert_to_float(h_A_f16, h_A_q, size_A);
+        convert_to_float(h_B_f16, h_B_q, size_B);
+        cpu_gemm_ref(h_A_q, h_B_q, h_C_ref, M, N, K);
+        free(h_A_q);
+        free(h_B_q);
+        printf("  [verify cuBLAS vs CPU ref]\n");
+        verify_result(h_C_cublas, h_C_ref, (int)size_C, kVerifyAtol,
+                      kVerifyRtol);
     } else {
-        printf("  [verify] N>512 skip\n");
+        printf("  [verify] N>512: CPU reference skipped, checking against "
+               "cuBLAS only\n");
     }
+
+    // Clears the output first (stale results can't pass), launches, checks
+    // launch + execution errors, then compares against both references.
+    // `launch` returns false if the kernel doesn't support this shape.
+    auto verify_kernel = [&](const char* name, float* d_C, float* h_C,
+                             auto&& launch) {
+        CUDA_CHECK(cudaMemset(d_C, 0, size_C * sizeof(float)));
+        if (!launch()) {
+            printf("  [verify %s] skipped (shape not divisible)\n", name);
+            return;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_C, d_C, size_C * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        if (h_C_ref) {
+            printf("  [verify %s vs CPU ref]\n", name);
+            verify_result(h_C, h_C_ref, (int)size_C, kVerifyAtol,
+                          kVerifyRtol);
+        }
+        printf("  [verify %s vs cuBLAS]\n", name);
+        verify_result(h_C, h_C_cublas, (int)size_C, kVerifyAtol, kVerifyRtol);
+    };
+
+    verify_kernel("naive wmma kernel", d_C_wmma, h_C_wmma, [&]() {
+        run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K);
+        return true;
+    });
+    verify_kernel("tiled wmma kernel", d_C_tiled, h_C_tiled, [&]() {
+        run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K);
+        return true;
+    });
+    verify_kernel("tiled+dbuf wmma kernel", d_C_dbuf, h_C_dbuf, [&]() {
+        run_wmma_tiled_dbuf_gemm(d_A, d_B, d_C_dbuf, M, N, K);
+        return true;
+    });
+    verify_kernel("warptile wmma kernel", d_C_warptile, h_C_warptile, [&]() {
+        run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K);
+        return true;
+    });
+    for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
+        verify_kernel(V4E_NAMES[cfg], d_C_v4e, h_C_v4e, [&]() {
+            return run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K);
+        });
+    }
+    free(h_C_ref);
 
     // ---------- Benchmark: naive wmma kernel ----------
     float avg_ms_wmma =
         benchmark_kernel([&]() { run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K); });
+    CUDA_CHECK(cudaGetLastError());
     double gflops_wmma = compute_gflops(M, N, K, avg_ms_wmma);
     printf("  [bench] naive WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_wmma, gflops_wmma);
@@ -814,6 +902,7 @@ int main(int argc, char** argv) {
     // ---------- Benchmark: shared memory tiled wmma kernel ----------
     float avg_ms_tiled = benchmark_kernel(
         [&]() { run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K); });
+    CUDA_CHECK(cudaGetLastError());
     double gflops_tiled = compute_gflops(M, N, K, avg_ms_tiled);
     printf("  [bench] tiled WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_tiled, gflops_tiled);
@@ -823,6 +912,7 @@ int main(int argc, char** argv) {
     // ---------- Benchmark: tiled + double buffering wmma kernel ----------
     float avg_ms_dbuf = benchmark_kernel(
         [&]() { run_wmma_tiled_dbuf_gemm(d_A, d_B, d_C_dbuf, M, N, K); });
+    CUDA_CHECK(cudaGetLastError());
     double gflops_dbuf = compute_gflops(M, N, K, avg_ms_dbuf);
     printf("  [bench] tiled+dbuf WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_dbuf, gflops_dbuf);
@@ -832,6 +922,7 @@ int main(int argc, char** argv) {
     // ---------- Benchmark: warp-level multi-fragment tiling wmma kernel ----------
     float avg_ms_warptile = benchmark_kernel(
         [&]() { run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K); });
+    CUDA_CHECK(cudaGetLastError());
     double gflops_warptile = compute_gflops(M, N, K, avg_ms_warptile);
     printf("  [bench] warptile WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
            avg_ms_warptile, gflops_warptile);
@@ -856,8 +947,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------- Benchmark: cuBLAS run Tensor Core----------
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    // (handle was created in the verify section above)
 
     float avg_ms_cublas = benchmark_kernel([&]() {
         run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
