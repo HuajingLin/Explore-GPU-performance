@@ -10,7 +10,7 @@
 //   ./build/v4_wmma 4096
 // Soak (one kernel only, sustained load, GFLOPS printed every ~0.5 s; use it
 // together with an nvidia-smi log to see steady-state clock / power):
-//   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | w64s | shell | cublas, seconds
+//   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | w64s | cublas, seconds
 // Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
 // [compare] lines: T4 clocks/power state swing cuBLAS by up to ~40%.
 // The [attr] lines report regs / spills / smem / blocks-per-SM per config.
@@ -493,10 +493,6 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
 // kSpread = 1: the same loads are issued in small groups, one group before
 //              each row of MMAs, to relieve the global-memory pipe
 //              (ncu: lg_throttle was 0.53 here vs 0.12 in cuBLAS).
-// kSpread = 2: kSpread = 1 plus "shell order" for the fragment loads: each
-//              fragment is loaded from smem right before its first MMA.
-//              (ncu: the 12 back-to-back LDSM took 9% of all samples; cuBLAS
-//              puts one or two HMMA between every pair of memory ops.)
 template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
           int kStages = 2, int kSpread = 0>
 __global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32, kMinBlocks)
@@ -638,59 +634,23 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
 
 #pragma unroll
         for (int kk = 0; kk < kBK; kk += WMMA_K) {
-            if (kSpread == 2) {
-                // Shell order: fragment t is loaded right before its first
-                // use, so the ldmatrix instructions are spread between the
-                // MMAs instead of being issued back to back. Shell t runs
-                // every MMA whose larger index is t. Each acc[i][j] still
-                // sees kk in ascending order, so results are unchanged.
 #pragma unroll
-                for (int t = 0; t < (kFragM > kFragN ? kFragM : kFragN); ++t) {
-                    if (t < kFragM)
-                        wmma::load_matrix_sync(
-                            a_frag[t],
-                            As_cur + (warpRow * kWM + t * WMMA_M) * kAsLd + kk,
-                            kAsLd);
-                    if (t < kFragN)
-                        wmma::load_matrix_sync(
-                            b_frag[t],
-                            Bs_cur + kk * kBsLd + warpCol * kWN + t * WMMA_N,
-                            kBsLd);
-                    if (t < kFragM)
-                        load_global_slot(kNext, (kk / WMMA_K) * kFragM + t);
+            for (int i = 0; i < kFragM; ++i)
+                wmma::load_matrix_sync(
+                    a_frag[i], As_cur + (warpRow * kWM + i * WMMA_M) * kAsLd + kk,
+                    kAsLd);
 #pragma unroll
-                    for (int j = 0; j < t && j < kFragN; ++j)
-                        if (t < kFragM)
-                            wmma::mma_sync(acc[t][j], a_frag[t], b_frag[j],
-                                           acc[t][j]);
+            for (int j = 0; j < kFragN; ++j)
+                wmma::load_matrix_sync(
+                    b_frag[j], Bs_cur + kk * kBsLd + warpCol * kWN + j * WMMA_N,
+                    kBsLd);
 #pragma unroll
-                    for (int i = 0; i < t && i < kFragM; ++i)
-                        if (t < kFragN)
-                            wmma::mma_sync(acc[i][t], a_frag[i], b_frag[t],
-                                           acc[i][t]);
-                    if (t < kFragM && t < kFragN)
-                        wmma::mma_sync(acc[t][t], a_frag[t], b_frag[t],
-                                       acc[t][t]);
-                }
-            } else {
-#pragma unroll
-                for (int i = 0; i < kFragM; ++i)
-                    wmma::load_matrix_sync(
-                        a_frag[i], As_cur + (warpRow * kWM + i * WMMA_M) * kAsLd + kk,
-                        kAsLd);
+            for (int i = 0; i < kFragM; ++i) {
+                if (kSpread != 0)
+                    load_global_slot(kNext, (kk / WMMA_K) * kFragM + i);
 #pragma unroll
                 for (int j = 0; j < kFragN; ++j)
-                    wmma::load_matrix_sync(
-                        b_frag[j], Bs_cur + kk * kBsLd + warpCol * kWN + j * WMMA_N,
-                        kBsLd);
-#pragma unroll
-                for (int i = 0; i < kFragM; ++i) {
-                    if (kSpread == 1)
-                        load_global_slot(kNext, (kk / WMMA_K) * kFragM + i);
-#pragma unroll
-                    for (int j = 0; j < kFragN; ++j)
-                        wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
-                }
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
             }
         }
 
@@ -776,37 +736,41 @@ void print_v4e_attrs(const char* name) {
 //                  68-70% @2048, 82% @4096).
 //                  254 regs is 1 below the limit: re-check local(spill)
 //                  after ANY edit to the kernel.
+//   V4e-w64-sprd : w64-1stg with spread global loads (244 regs). What the
+//                  dispatcher uses for N >= 1024.
+// Tried and removed (2026-11-15): shell-ordered fragment loads. Same
+// instruction count and cycles as w64-sprd: the compiler decides where the
+// LDSM instructions go, source order inside the WMMA API does not.
 #define V4E_CFG_128x64 128, 64, 32, 64, 32
 #define V4E_CFG_W64_1STG 128, 128, 32, 64, 64, 1, 1
-// Experiment (2026-11-15): w64-1stg with the global loads spread between the
-// MMA rows. Not used by the dispatcher until it is measured to be faster.
+// w64-1stg with the global loads spread between the MMA rows (kSpread = 1).
+// ncu at N=2048 (2026-11-15): 745,016 cycles vs 756,547 for w64-1stg (-1.5%),
+// 244 registers instead of 254, bit-identical output. The dispatcher uses it
+// for the 128x128 case. V4e-w64-1stg is kept as the comparison baseline.
 #define V4E_CFG_W64_SPRD 128, 128, 32, 64, 64, 1, 1, 1
-// Experiment (2026-11-15): as above plus shell-ordered fragment loads.
-#define V4E_CFG_W64_SHELL 128, 128, 32, 64, 64, 1, 1, 2
-#define V4E_NUM_CFGS 5
-#define V4E_AUTO 4  // index of the size-based dispatcher
+#define V4E_NUM_CFGS 4
+#define V4E_AUTO 3  // index of the size-based dispatcher
 static const char* V4E_NAMES[V4E_NUM_CFGS] = {"V4e-128x64", "V4e-w64-1stg",
-                                              "V4e-w64-sprd", "V4e-w64-shell",
-                                              "V4e-auto"};
+                                              "V4e-w64-sprd", "V4e-auto"};
 
 void print_all_v4e_attrs() {
     print_v4e_attrs<V4E_CFG_128x64>(V4E_NAMES[0]);
     print_v4e_attrs<V4E_CFG_W64_1STG>(V4E_NAMES[1]);
     print_v4e_attrs<V4E_CFG_W64_SPRD>(V4E_NAMES[2]);
-    print_v4e_attrs<V4E_CFG_W64_SHELL>(V4E_NAMES[3]);
 }
 
 // Size-based dispatcher. If a 128x128 grid would give fewer blocks than the
 // device has SMs (40 on a T4; queried at runtime), use the smaller 128x64
 // tile so every SM gets work.
-// Returns the config index (0 or 1), or -1 if neither shape fits.
+// Returns the config index (0 = 128x64, 2 = w64-sprd), or -1 if neither
+// shape fits.
 int v4e_auto_choice(int M, int N, int K) {
     const int kNumSMs = device_num_sms();
-    bool w64_ok = v4e_shape_ok<V4E_CFG_W64_1STG>(M, N, K);
+    bool w64_ok = v4e_shape_ok<V4E_CFG_W64_SPRD>(M, N, K);
     bool c64_ok = v4e_shape_ok<V4E_CFG_128x64>(M, N, K);
-    if (w64_ok && (M / 128) * (N / 128) >= kNumSMs) return 1;
+    if (w64_ok && (M / 128) * (N / 128) >= kNumSMs) return 2;
     if (c64_ok) return 0;
-    if (w64_ok) return 1;
+    if (w64_ok) return 2;
     return -1;
 }
 
@@ -826,10 +790,6 @@ bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
         case 2:
             if (!v4e_shape_ok<V4E_CFG_W64_SPRD>(M, N, K)) return false;
             run_wmma_blocktile_gemm<V4E_CFG_W64_SPRD>(d_A, d_B, d_C, M, N, K);
-            return true;
-        case 3:
-            if (!v4e_shape_ok<V4E_CFG_W64_SHELL>(M, N, K)) return false;
-            run_wmma_blocktile_gemm<V4E_CFG_W64_SHELL>(d_A, d_B, d_C, M, N, K);
             return true;
     }
     return false;
@@ -913,7 +873,7 @@ int main(int argc, char** argv) {
                            cudaMemcpyHostToDevice));
 
     // ---------- soak mode: one kernel, sustained load ----------
-    // ./v4_wmma N soak <v4e|128x64|w64|w64s|shell|cublas> [seconds]
+    // ./v4_wmma N soak <v4e|128x64|w64|w64s|cublas> [seconds]
     // The T4 is power-capped at 70 W; under sustained load the driver lowers
     // the clock. This mode shows each kernel's steady-state throughput on
     // its own, without other kernels heating/cooling the GPU in between.
@@ -930,12 +890,10 @@ int main(int argc, char** argv) {
             cfg = 1;
         } else if (strcmp(target, "w64s") == 0) {
             cfg = 2;
-        } else if (strcmp(target, "shell") == 0) {
-            cfg = 3;
         } else if (strcmp(target, "v4e") == 0) {
             cfg = V4E_AUTO;
         } else {
-            fprintf(stderr, "usage: %s N soak <v4e|128x64|w64|w64s|shell|cublas> [seconds]\n",
+            fprintf(stderr, "usage: %s N soak <v4e|128x64|w64|w64s|cublas> [seconds]\n",
                     argv[0]);
             return EXIT_FAILURE;
         }
@@ -1145,7 +1103,18 @@ int main(int argc, char** argv) {
     // "% of cuBLAS" number unreliable, so each round measures cuBLAS right
     // before and right after the V4e configs and divides by their mean.
     // We report the median ratio over all rounds plus its min..max spread.
-    const int kRounds = 7;
+    //
+    // The order of the V4e configs is rotated every round. With a fixed
+    // order the same kernel scored 69% in 2nd place and 75% in 5th place
+    // (N=2048, 2026-11-15): the power-capped T4 changes clock within a
+    // round, so position mattered more than the kernel. With rotation and
+    // kRounds = 2 x (number of configs), every config sits in every position
+    // exactly twice. Expect a wider min..max than before; compare medians.
+    std::vector<int> valid_cfgs;
+    for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg)
+        if (gflops_v4e[cfg] > 0.0) valid_cfgs.push_back(cfg);
+    const int kNumValid = (int)valid_cfgs.size();
+    const int kRounds = kNumValid > 0 ? 2 * kNumValid : 1;
     std::vector<double> cub_gf;
     std::vector<std::vector<double>> ratio(V4E_NUM_CFGS);
     auto bench_cublas_gf = [&]() {
@@ -1157,8 +1126,8 @@ int main(int argc, char** argv) {
     for (int r = 0; r < kRounds; ++r) {
         double before = bench_cublas_gf();
         double gf[V4E_NUM_CFGS] = {};
-        for (int cfg = 0; cfg < V4E_NUM_CFGS; ++cfg) {
-            if (gflops_v4e[cfg] <= 0.0) continue;  // shape not supported
+        for (int i = 0; i < kNumValid; ++i) {
+            const int cfg = valid_cfgs[(i + r) % kNumValid];  // rotated order
             float ms = benchmark_kernel(
                 [&]() { run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K); });
             gf[cfg] = compute_gflops(M, N, K, ms);
@@ -1175,7 +1144,7 @@ int main(int argc, char** argv) {
         size_t n = v.size();
         return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
     };
-    printf("  [robust] %d rounds; cuBLAS GFLOPS median=%.0f (min %.0f, max %.0f)\n",
+    printf("  [robust] %d rounds, config order rotated; cuBLAS GFLOPS median=%.0f (min %.0f, max %.0f)\n",
            kRounds, median(cub_gf),
            *std::min_element(cub_gf.begin(), cub_gf.end()),
            *std::max_element(cub_gf.begin(), cub_gf.end()));
