@@ -8,6 +8,9 @@
 //   ./build/v4_wmma 1024    # N > 512: every kernel is verified against cuBLAS only
 //   ./build/v4_wmma 2048
 //   ./build/v4_wmma 4096
+// Soak (one kernel only, sustained load, GFLOPS printed every ~0.5 s; use it
+// together with an nvidia-smi log to see steady-state clock / power):
+//   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | cublas, seconds
 // Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
 // [compare] lines: T4 clocks/power state swing cuBLAS by up to ~40%.
 // The [attr] lines report regs / spills / smem / blocks-per-SM per config.
@@ -17,6 +20,8 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <vector>
 
 using namespace nvcuda;
@@ -811,6 +816,63 @@ int main(int argc, char** argv) {
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B_f16, size_B * sizeof(half),
                            cudaMemcpyHostToDevice));
+
+    // ---------- soak mode: one kernel, sustained load ----------
+    // ./v4_wmma N soak <v4e|128x64|w64|cublas> [seconds]
+    // The T4 is power-capped at 70 W; under sustained load the driver lowers
+    // the clock. This mode shows each kernel's steady-state throughput on
+    // its own, without other kernels heating/cooling the GPU in between.
+    if (argc > 2 && strcmp(argv[2], "soak") == 0) {
+        const char* target = (argc > 3) ? argv[3] : "v4e";
+        const double seconds = (argc > 4) ? atof(argv[4]) : 6.0;
+        cublasHandle_t soak_handle = nullptr;
+        int cfg = -1;
+        if (strcmp(target, "cublas") == 0) {
+            CUBLAS_CHECK(cublasCreate(&soak_handle));
+        } else if (strcmp(target, "128x64") == 0) {
+            cfg = 0;
+        } else if (strcmp(target, "w64") == 0) {
+            cfg = 1;
+        } else if (strcmp(target, "v4e") == 0) {
+            cfg = 2;
+        } else {
+            fprintf(stderr, "usage: %s N soak <v4e|128x64|w64|cublas> [seconds]\n",
+                    argv[0]);
+            return EXIT_FAILURE;
+        }
+        auto launch = [&]() {
+            if (soak_handle) {
+                run_cublas_gemm(soak_handle, d_A, d_B, d_C_cublas, M, N, K);
+            } else if (!run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K)) {
+                fprintf(stderr, "ERROR: shape not supported by %s\n", target);
+                exit(EXIT_FAILURE);
+            }
+        };
+        using clk = std::chrono::steady_clock;
+        auto secs = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+        printf("  [soak] target=%s, %.1f s\n", target, seconds);
+        const int kBatch = 20;
+        const auto t0 = clk::now();
+        while (secs(t0, clk::now()) < seconds) {
+            const auto w0 = clk::now();
+            int launches = 0;
+            do {
+                for (int i = 0; i < kBatch; ++i) launch();
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                launches += kBatch;
+            } while (secs(w0, clk::now()) < 0.5);
+            const auto w1 = clk::now();
+            const float ms = (float)(secs(w0, w1) * 1000.0 / launches);
+            printf("  [soak] t=%5.1f s  %7.3f ms/GEMM  %8.0f GFLOPS\n",
+                   secs(t0, w1), ms, compute_gflops(M, N, K, ms));
+            fflush(stdout);
+        }
+        if (soak_handle) CUBLAS_CHECK(cublasDestroy(soak_handle));
+        return 0;  // process exit releases host/device buffers
+    }
 
     // ---------- verify ----------
     // Two references, both built from the SAME FP16-rounded inputs the
