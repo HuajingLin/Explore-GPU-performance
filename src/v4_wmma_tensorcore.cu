@@ -10,7 +10,7 @@
 //   ./build/v4_wmma 4096
 // Soak (one kernel only, sustained load, GFLOPS printed every ~0.5 s; use it
 // together with an nvidia-smi log to see steady-state clock / power):
-//   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | cublas, seconds
+//   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | w64s | cublas, seconds
 // Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
 // [compare] lines: T4 clocks/power state swing cuBLAS by up to ~40%.
 // The [attr] lines report regs / spills / smem / blocks-per-SM per config.
@@ -488,8 +488,13 @@ void run_wmma_warptile_gemm(const half* d_A, const half* d_B, float* d_C,
 // kStages = 1: one shared-memory buffer (half the smem), two barriers per K
 //              step. The next tile is still prefetched into registers, so
 //              global-load latency is still overlapped with the MMAs.
+// kSpread = 0: all global loads of the next tile are issued back to back at
+//              the top of the K step.
+// kSpread = 1: the same loads are issued in small groups, one group before
+//              each row of MMAs, to relieve the global-memory pipe
+//              (ncu: lg_throttle was 0.53 here vs 0.12 in cuBLAS).
 template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
-          int kStages = 2>
+          int kStages = 2, int kSpread = 0>
 __global__ void __launch_bounds__((kBM / kWM) * (kBN / kWN) * 32, kMinBlocks)
 wmma_blocktile_gemm_kernel(const half* __restrict__ A,
                            const half* __restrict__ B,
@@ -565,6 +570,31 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
         }
     };
 
+    // kSpread: the K step has kLoadSlots = (kBK/16) * kFragM rows of MMAs.
+    // Global load number n (A vectors first, then B vectors) goes to slot
+    // n * kLoadSlots / kLoadsPerT. `slot` is a constant after unrolling, so
+    // the tests below fold away and ra[]/rb[] stay in registers.
+    constexpr int kLoadsPerT = kAPerT + kBPerT;
+    constexpr int kLoadSlots = (kBK / WMMA_K) * kFragM;
+    auto load_global_slot = [&](int k0, int slot) {
+#pragma unroll
+        for (int i = 0; i < kAPerT; ++i) {
+            if ((i * kLoadSlots) / kLoadsPerT != slot) continue;
+            int idx = tid + i * kThreads;
+            int r = idx / kAVecsPerRow;
+            int c = (idx % kAVecsPerRow) * 8;
+            ra[i] = *reinterpret_cast<const int4*>(Ag + (size_t)r * K + k0 + c);
+        }
+#pragma unroll
+        for (int i = 0; i < kBPerT; ++i) {
+            if (((kAPerT + i) * kLoadSlots) / kLoadsPerT != slot) continue;
+            int idx = tid + i * kThreads;
+            int r = idx / kBVecsPerRow;
+            int c = (idx % kBVecsPerRow) * 8;
+            rb[i] = *reinterpret_cast<const int4*>(Bg + (size_t)(k0 + r) * N + c);
+        }
+    };
+
     auto store_shared = [&](int buf) {
 #pragma unroll
         for (int i = 0; i < kAPerT; ++i) {
@@ -591,8 +621,13 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
     for (int k0 = 0; k0 < K; k0 += kBK) {
         const bool hasNext = (k0 + kBK) < K;
 
-        // issue the next tile's global loads first; latency overlaps the MMAs
-        if (hasNext) load_global(k0 + kBK);
+        // kSpread == 0: issue the next tile's global loads first; latency
+        // overlaps the MMAs.
+        if (kSpread == 0 && hasNext) load_global(k0 + kBK);
+        // kSpread == 1: the loads are issued between the MMA rows below.
+        // Kept branch-free: on the last K step they re-read the current
+        // tile, and that result is never stored.
+        const int kNext = hasNext ? k0 + kBK : k0;
 
         const half* As_cur = As[buf];
         const half* Bs_cur = Bs[buf];
@@ -610,10 +645,13 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
                     b_frag[j], Bs_cur + kk * kBsLd + warpCol * kWN + j * WMMA_N,
                     kBsLd);
 #pragma unroll
-            for (int i = 0; i < kFragM; ++i)
+            for (int i = 0; i < kFragM; ++i) {
+                if (kSpread != 0)
+                    load_global_slot(kNext, (kk / WMMA_K) * kFragM + i);
 #pragma unroll
                 for (int j = 0; j < kFragN; ++j)
                     wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+            }
         }
 
         if (hasNext) {
@@ -646,29 +684,29 @@ wmma_blocktile_gemm_kernel(const half* __restrict__ A,
 }
 
 template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
-          int kStages = 2>
+          int kStages = 2, int kSpread = 0>
 bool v4e_shape_ok(int M, int N, int K) {
     return (M % kBM == 0) && (N % kBN == 0) && (K % kBK == 0);
 }
 
 template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
-          int kStages = 2>
+          int kStages = 2, int kSpread = 0>
 void run_wmma_blocktile_gemm(const half* d_A, const half* d_B, float* d_C,
                              int M, int N, int K) {
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
     require_shape("V4e", M, N, K, kBM, kBN, kBK);
     dim3 block(kThreads);
     dim3 grid(N / kBN, M / kBM);
-    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages>
+    wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages, kSpread>
         <<<grid, block>>>(d_A, d_B, d_C, M, N, K);
 }
 
 // Prints registers, local memory (spills), static smem and how many blocks
 // fit per SM, as reported by the runtime for the compiled kernel.
 template <int kBM, int kBN, int kBK, int kWM, int kWN, int kMinBlocks = 1,
-          int kStages = 2>
+          int kStages = 2, int kSpread = 0>
 void print_v4e_attrs(const char* name) {
-    auto kern = wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages>;
+    auto kern = wmma_blocktile_gemm_kernel<kBM, kBN, kBK, kWM, kWN, kMinBlocks, kStages, kSpread>;
     constexpr int kThreads = (kBM / kWM) * (kBN / kWN) * 32;
     cudaFuncAttributes attr;
     CUDA_CHECK(cudaFuncGetAttributes(&attr, kern));
@@ -700,13 +738,18 @@ void print_v4e_attrs(const char* name) {
 //                  after ANY edit to the kernel.
 #define V4E_CFG_128x64 128, 64, 32, 64, 32
 #define V4E_CFG_W64_1STG 128, 128, 32, 64, 64, 1, 1
-#define V4E_NUM_CFGS 3
+// Experiment (2026-11-15): w64-1stg with the global loads spread between the
+// MMA rows. Not used by the dispatcher until it is measured to be faster.
+#define V4E_CFG_W64_SPRD 128, 128, 32, 64, 64, 1, 1, 1
+#define V4E_NUM_CFGS 4
+#define V4E_AUTO 3  // index of the size-based dispatcher
 static const char* V4E_NAMES[V4E_NUM_CFGS] = {"V4e-128x64", "V4e-w64-1stg",
-                                              "V4e-auto"};
+                                              "V4e-w64-sprd", "V4e-auto"};
 
 void print_all_v4e_attrs() {
     print_v4e_attrs<V4E_CFG_128x64>(V4E_NAMES[0]);
     print_v4e_attrs<V4E_CFG_W64_1STG>(V4E_NAMES[1]);
+    print_v4e_attrs<V4E_CFG_W64_SPRD>(V4E_NAMES[2]);
 }
 
 // Size-based dispatcher. If a 128x128 grid would give fewer blocks than the
@@ -723,10 +766,10 @@ int v4e_auto_choice(int M, int N, int K) {
     return -1;
 }
 
-// Launch config `cfg` (0..V4E_NUM_CFGS-1). Returns false if the shape doesn't fit.
+// Launch config `cfg` (0..V4E_NUM_CFGS-1; V4E_AUTO = size-based dispatcher). Returns false if the shape doesn't fit.
 bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
                  int N, int K) {
-    if (cfg == 2) cfg = v4e_auto_choice(M, N, K);
+    if (cfg == V4E_AUTO) cfg = v4e_auto_choice(M, N, K);
     switch (cfg) {
         case 0:
             if (!v4e_shape_ok<V4E_CFG_128x64>(M, N, K)) return false;
@@ -735,6 +778,10 @@ bool run_v4e_cfg(int cfg, const half* d_A, const half* d_B, float* d_C, int M,
         case 1:
             if (!v4e_shape_ok<V4E_CFG_W64_1STG>(M, N, K)) return false;
             run_wmma_blocktile_gemm<V4E_CFG_W64_1STG>(d_A, d_B, d_C, M, N, K);
+            return true;
+        case 2:
+            if (!v4e_shape_ok<V4E_CFG_W64_SPRD>(M, N, K)) return false;
+            run_wmma_blocktile_gemm<V4E_CFG_W64_SPRD>(d_A, d_B, d_C, M, N, K);
             return true;
     }
     return false;
@@ -818,7 +865,7 @@ int main(int argc, char** argv) {
                            cudaMemcpyHostToDevice));
 
     // ---------- soak mode: one kernel, sustained load ----------
-    // ./v4_wmma N soak <v4e|128x64|w64|cublas> [seconds]
+    // ./v4_wmma N soak <v4e|128x64|w64|w64s|cublas> [seconds]
     // The T4 is power-capped at 70 W; under sustained load the driver lowers
     // the clock. This mode shows each kernel's steady-state throughput on
     // its own, without other kernels heating/cooling the GPU in between.
@@ -833,10 +880,12 @@ int main(int argc, char** argv) {
             cfg = 0;
         } else if (strcmp(target, "w64") == 0) {
             cfg = 1;
-        } else if (strcmp(target, "v4e") == 0) {
+        } else if (strcmp(target, "w64s") == 0) {
             cfg = 2;
+        } else if (strcmp(target, "v4e") == 0) {
+            cfg = V4E_AUTO;
         } else {
-            fprintf(stderr, "usage: %s N soak <v4e|128x64|w64|cublas> [seconds]\n",
+            fprintf(stderr, "usage: %s N soak <v4e|128x64|w64|w64s|cublas> [seconds]\n",
                     argv[0]);
             return EXIT_FAILURE;
         }
