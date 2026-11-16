@@ -9,6 +9,8 @@ and GFLOPS calculation.*/
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <vector>
 
 // ---------- CUDA Error-checking macros ----------
 #define CUDA_CHECK(call)                                                     \
@@ -115,4 +117,34 @@ float benchmark_kernel(KernelLauncher launch_fn, int warmup_iters = 3,
     CUDA_CHECK(cudaEventDestroy(stop));
 
     return total_ms / bench_iters;  // Average time per instance (ms)
+}
+
+// ---------- Repeated multiple times within the same measurement window ----------
+// Repeats the SAME short window `repeats` times and reports median / min /
+// max of the per-launch time. The window length is unchanged on purpose:
+// on a power-capped GPU a longer window lets the clock adapt to the kernel
+// and measures something else (see the [sustained] section of the benchmark).
+struct BenchStats {
+    float median_ms;
+    float min_ms;
+    float max_ms;
+};
+
+template <typename KernelLauncher>
+BenchStats benchmark_kernel_stats(KernelLauncher launch_fn, int repeats = 5,
+                                   int warmup_iters = 3, int bench_iters = 10) {
+    if (repeats < 1) repeats = 1;
+    std::vector<float> t;
+    for (int r = 0; r < repeats; ++r) {
+        // warm up only before the first repeat
+        t.push_back(benchmark_kernel(launch_fn, r == 0 ? warmup_iters : 0,
+                                     bench_iters));
+    }
+    std::sort(t.begin(), t.end());
+    const size_t n = t.size();
+    BenchStats st;
+    st.median_ms = (n % 2) ? t[n / 2] : 0.5f * (t[n / 2 - 1] + t[n / 2]);
+    st.min_ms = t.front();
+    st.max_ms = t.back();
+    return st;
 }

@@ -11,8 +11,15 @@
 // Soak (one kernel only, sustained load, GFLOPS printed every ~0.5 s; use it
 // together with an nvidia-smi log to see steady-state clock / power):
 //   ./build/v4_wmma 2048 soak v4e 6      # v4e | 128x64 | w64 | w64s | cublas, seconds
-// Judge "% of cuBLAS" on the [robust] median lines, not the single-shot
-// [compare] lines: T4 clocks/power state swing cuBLAS by up to ~40%.
+// Two ratios are reported; they answer different questions:
+//   [robust]    equal-CLOCK ratio. Short interleaved windows, config order
+//               rotated, so every kernel runs at the same GPU clock. This is
+//               kernel efficiency, and what the >= 70% criterion is judged on.
+//   [sustained] equal-POWER ratio. Each kernel alone under sustained load;
+//               on the 70 W-capped T4 the driver settles on a different clock
+//               for each kernel. This is the throughput you actually get.
+// The single-shot [bench]/[compare] lines are only a first look: clocks are
+// still moving while they are measured.
 // The [attr] lines report regs / spills / smem / blocks-per-SM per config.
 
 #include "common.cuh"
@@ -22,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 using namespace nvcuda;
@@ -63,6 +71,31 @@ static void require_shape(const char* name, int M, int N, int K, int bm,
                 name, M, N, K, bm, bn, bk);
         exit(EXIT_FAILURE);
     }
+}
+
+// Runs `launch` continuously: `warm_s` seconds unmeasured (lets a
+// power-capped GPU settle on its clock for this kernel), then `meas_s`
+// seconds measured. Returns the average time per launch in ms.
+template <typename Launch>
+double sustained_ms_per_launch(Launch launch, double warm_s, double meas_s) {
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    const int kBatch = 20;
+    auto run_for = [&](double s) {
+        const auto t0 = clk::now();
+        int launches = 0;
+        do {
+            for (int i = 0; i < kBatch; ++i) launch();
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            launches += kBatch;
+        } while (secs(t0, clk::now()) < s);
+        return secs(t0, clk::now()) * 1000.0 / launches;
+    };
+    run_for(warm_s);
+    return run_for(meas_s);
 }
 
 // Number of SMs on the current device (40 on a Tesla T4), queried once.
@@ -1021,41 +1054,53 @@ int main(int argc, char** argv) {
     else
         printf("  [verify] all checks passed\n");
 
+    // Single-shot [bench] lines: the same short window repeated 5 times;
+    // median with min..max. `bst` holds the stats of the latest measurement.
+    BenchStats bst = {0.0f, 0.0f, 0.0f};
+    auto bench_median = [&](auto&& fn) {
+        bst = benchmark_kernel_stats(fn);
+        return bst.median_ms;
+    };
+
     // ---------- Benchmark: naive wmma kernel ----------
     float avg_ms_wmma =
-        benchmark_kernel([&]() { run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K); });
+        bench_median([&]() { run_wmma_gemm(d_A, d_B, d_C_wmma, M, N, K); });
     CUDA_CHECK(cudaGetLastError());
     double gflops_wmma = compute_gflops(M, N, K, avg_ms_wmma);
-    printf("  [bench] naive WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
-           avg_ms_wmma, gflops_wmma);
+    printf("  [bench] naive WMMA kernel: median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+           avg_ms_wmma, bst.min_ms, bst.max_ms,
+           gflops_wmma);
 
     // ---------- Benchmark: shared memory tiled wmma kernel ----------
-    float avg_ms_tiled = benchmark_kernel(
+    float avg_ms_tiled = bench_median(
         [&]() { run_wmma_tiled_gemm(d_A, d_B, d_C_tiled, M, N, K); });
     CUDA_CHECK(cudaGetLastError());
     double gflops_tiled = compute_gflops(M, N, K, avg_ms_tiled);
-    printf("  [bench] tiled WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
-           avg_ms_tiled, gflops_tiled);
+    printf("  [bench] tiled WMMA kernel: median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+           avg_ms_tiled, bst.min_ms, bst.max_ms,
+           gflops_tiled);
     printf("  [compare] tiled over naive promote: %.2fx\n",
            gflops_tiled / gflops_wmma);
 
     // ---------- Benchmark: tiled + double buffering wmma kernel ----------
-    float avg_ms_dbuf = benchmark_kernel(
+    float avg_ms_dbuf = bench_median(
         [&]() { run_wmma_tiled_dbuf_gemm(d_A, d_B, d_C_dbuf, M, N, K); });
     CUDA_CHECK(cudaGetLastError());
     double gflops_dbuf = compute_gflops(M, N, K, avg_ms_dbuf);
-    printf("  [bench] tiled+dbuf WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
-           avg_ms_dbuf, gflops_dbuf);
+    printf("  [bench] tiled+dbuf WMMA kernel: median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+           avg_ms_dbuf, bst.min_ms, bst.max_ms,
+           gflops_dbuf);
     printf("  [compare] tiled+dbuf over tiled promote: %.2fx\n",
            gflops_dbuf / gflops_tiled);
 
     // ---------- Benchmark: warp-level multi-fragment tiling wmma kernel ----------
-    float avg_ms_warptile = benchmark_kernel(
+    float avg_ms_warptile = bench_median(
         [&]() { run_wmma_warptile_gemm(d_A, d_B, d_C_warptile, M, N, K); });
     CUDA_CHECK(cudaGetLastError());
     double gflops_warptile = compute_gflops(M, N, K, avg_ms_warptile);
-    printf("  [bench] warptile WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
-           avg_ms_warptile, gflops_warptile);
+    printf("  [bench] warptile WMMA kernel: median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+           avg_ms_warptile, bst.min_ms, bst.max_ms,
+           gflops_warptile);
     printf("  [compare] warptile over tiled promote: %.2fx\n",
            gflops_warptile / gflops_tiled);
 
@@ -1069,22 +1114,24 @@ int main(int argc, char** argv) {
         }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        float ms = benchmark_kernel(
+        float ms = bench_median(
             [&]() { run_v4e_cfg(cfg, d_A, d_B, d_C_v4e, M, N, K); });
         gflops_v4e[cfg] = compute_gflops(M, N, K, ms);
-        printf("  [bench] %s WMMA kernel: avg_time=%.3f ms, GFLOPS=%.2f\n",
-               V4E_NAMES[cfg], ms, gflops_v4e[cfg]);
+        printf("  [bench] %s WMMA kernel: median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+               V4E_NAMES[cfg], ms, bst.min_ms, bst.max_ms,
+               gflops_v4e[cfg]);
     }
 
     // ---------- Benchmark: cuBLAS run Tensor Core----------
     // (handle was created in the verify section above)
 
-    float avg_ms_cublas = benchmark_kernel([&]() {
+    float avg_ms_cublas = bench_median([&]() {
         run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
     });
     double gflops_cublas = compute_gflops(M, N, K, avg_ms_cublas);
-    printf("  [bench] cuBLAS(TensorCore): avg_time=%.3f ms, GFLOPS=%.2f\n",
-           avg_ms_cublas, gflops_cublas);
+    printf("  [bench] cuBLAS(TensorCore): median_time=%.3f ms (min %.3f, max %.3f), GFLOPS=%.2f\n",
+           avg_ms_cublas, bst.min_ms, bst.max_ms,
+           gflops_cublas);
 
     double pct_naive = 100.0 * gflops_wmma / gflops_cublas;
     double pct_tiled = 100.0 * gflops_tiled / gflops_cublas;
@@ -1155,6 +1202,8 @@ int main(int argc, char** argv) {
         size_t n = v.size();
         return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
     };
+    printf("  [robust] equal-CLOCK ratio (kernel efficiency): short "
+           "interleaved windows, same GPU clock for all\n");
     printf("  [robust] %d rounds, config order rotated; cuBLAS GFLOPS median=%.0f (min %.0f, max %.0f)\n",
            kRounds, median(cub_gf),
            *std::min_element(cub_gf.begin(), cub_gf.end()),
@@ -1168,6 +1217,37 @@ int main(int argc, char** argv) {
     }
     printf("  (Acceptance Criteria: N>=1024 >= 70%% Deemed to meet the standard.)\n");
     printf("  (Judge acceptance on the [robust] median, not the single-shot [compare].)\n");
+
+    // ---------- Sustained ratio: each kernel alone, at its own steady clock ----------
+    // On a power-capped GPU (T4: 70 W) the driver lowers the clock until the
+    // power fits, and a kernel that draws more power per cycle is clocked
+    // lower. Measured 2026-11-15 at N=2048: V4e ~850 MHz, cuBLAS ~655 MHz,
+    // both ~69 W, throughput within 4%. So this ratio is usually much higher
+    // than [robust]; both are correct, they answer different questions.
+    {
+        const int c = v4e_auto_choice(M, N, K);
+        if (c >= 0) {
+            const double kWarmS = 1.0, kMeasS = 2.0;
+            const double ms_v4e = sustained_ms_per_launch(
+                [&]() { run_v4e_cfg(V4E_AUTO, d_A, d_B, d_C_v4e, M, N, K); },
+                kWarmS, kMeasS);
+            // idle gap so the second measurement starts from a rested GPU
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            const double ms_cub = sustained_ms_per_launch(
+                [&]() { run_cublas_gemm(handle, d_A, d_B, d_C_cublas, M, N, K); },
+                kWarmS, kMeasS);
+            const double gf_v4e = compute_gflops(M, N, K, (float)ms_v4e);
+            const double gf_cub = compute_gflops(M, N, K, (float)ms_cub);
+            printf("  [sustained] equal-POWER ratio (throughput on this GPU): "
+                   "each kernel alone, %.0f s warm-up + %.0f s measured\n",
+                   kWarmS, kMeasS);
+            printf("  [sustained] V4e-auto (%s): %.0f GFLOPS   cuBLAS: %.0f "
+                   "GFLOPS   -> %.1f%% of cuBLAS\n",
+                   V4E_NAMES[c], gf_v4e, gf_cub, 100.0 * gf_v4e / gf_cub);
+            printf("  (Not the acceptance number. It depends on this GPU's "
+                   "power cap; [robust] does not.)\n");
+        }
+    }
 
     CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_A));
