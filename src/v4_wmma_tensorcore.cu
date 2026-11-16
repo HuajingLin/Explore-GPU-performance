@@ -15,9 +15,10 @@
 //   [robust]    equal-CLOCK ratio. Short interleaved windows, config order
 //               rotated, so every kernel runs at the same GPU clock. This is
 //               kernel efficiency, and what the >= 70% criterion is judged on.
-//   [sustained] equal-POWER ratio. Each kernel alone under sustained load;
-//               on the 70 W-capped T4 the driver settles on a different clock
-//               for each kernel. This is the throughput you actually get.
+//   [sustained] steady-state ratio. Each kernel alone under sustained load,
+//               at whatever clock the driver settles on for it. At large N
+//               the 70 W cap decides that clock (equal power, different
+//               clocks). This is the throughput you actually get.
 // The single-shot [bench]/[compare] lines are only a first look: clocks are
 // still moving while they are measured.
 // The [attr] lines report regs / spills / smem / blocks-per-SM per config.
@@ -1238,7 +1239,7 @@ int main(int argc, char** argv) {
                 kWarmS, kMeasS);
             const double gf_v4e = compute_gflops(M, N, K, (float)ms_v4e);
             const double gf_cub = compute_gflops(M, N, K, (float)ms_cub);
-            printf("  [sustained] equal-POWER ratio (throughput on this GPU): "
+            printf("  [sustained] steady-state ratio (throughput on this GPU): "
                    "each kernel alone, %.0f s warm-up + %.0f s measured\n",
                    kWarmS, kMeasS);
             printf("  [sustained] V4e-auto (%s): %.0f GFLOPS   cuBLAS: %.0f "
