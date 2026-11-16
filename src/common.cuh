@@ -30,17 +30,20 @@ inline void init_matrix(float* mat, int rows, int cols, unsigned seed = 42) {
 }
 
 // ---------- CPU reference implementation C = A(MxK) * B(KxN) ----------
-// For correctness verification only; a size of ≤ 512 is recommended, 
+// For correctness verification only; a size of <= 512 is recommended, 
 // otherwise it will be very slow.
 inline void cpu_gemm_ref(const float* A, const float* B, float* C, int M,
                           int N, int K) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
-            float sum = 0.0f;
+            // Accumulate in double so the reference itself carries no
+            // visible rounding error; the measured error is then the GPU's.
+            double sum = 0.0;
             for (int k = 0; k < K; ++k) {
-                sum += A[i * K + k] * B[k * N + j];
+                sum += static_cast<double>(A[i * K + k]) *
+                       static_cast<double>(B[k * N + j]);
             }
-            C[i * N + j] = sum;
+            C[i * N + j] = static_cast<float>(sum);
         }
     }
 }
@@ -50,16 +53,30 @@ inline bool verify_result(const float* gpu_result, const float* cpu_ref,
                            int size, float atol = 1e-3f, float rtol = 1e-3f) {
     double max_abs_err = 0.0;
     int first_bad_idx = -1;
+    int nan_count = 0;
     for (int i = 0; i < size; ++i) {
-        double diff = std::fabs(gpu_result[i] - cpu_ref[i]);
-        double tol = atol + rtol * std::fabs(cpu_ref[i]);
-        if (diff > tol) {
+        double diff = std::fabs(static_cast<double>(gpu_result[i]) -
+                                static_cast<double>(cpu_ref[i]));
+        double tol = atol + rtol * std::fabs(static_cast<double>(cpu_ref[i]));
+        // Written as !(diff <= tol) on purpose: a NaN diff (NaN in either
+        // input, or inf - inf) compares false with everything, so
+        // "diff > tol" would let it pass.
+        if (!(diff <= tol)) {
             if (first_bad_idx < 0) first_bad_idx = i;
         }
-        if (diff > max_abs_err) max_abs_err = diff;
+        if (std::isnan(diff)) {
+            ++nan_count;  // kept out of the maximum, reported separately
+        } else if (diff > max_abs_err) {
+            max_abs_err = diff;
+        }
     }
     printf("  [verify] max_abs_err=%.6e%s\n", max_abs_err,
            first_bad_idx < 0 ? " -> PASS" : " -> FAIL");
+    if (nan_count > 0) {
+        printf("  [verify] %d element(s) compare as NaN (NaN in a result, or "
+               "inf - inf)\n",
+               nan_count);
+    }
     if (first_bad_idx >= 0) {
         printf("  [verify] first mismatch at idx=%d gpu=%.6f cpu=%.6f\n",
                first_bad_idx, gpu_result[first_bad_idx], cpu_ref[first_bad_idx]);
@@ -67,7 +84,7 @@ inline bool verify_result(const float* gpu_result, const float* cpu_ref,
     return first_bad_idx < 0;
 }
 
-// ---------- GFLOPS Calculation ----------
+// ---------- GFLOPS Calculation: GEMM  2*M*N*K ----------
 inline double compute_gflops(int M, int N, int K, float ms) {
     double flops = 2.0 * M * N * K;
     double seconds = ms / 1000.0;
@@ -89,7 +106,7 @@ float benchmark_kernel(KernelLauncher launch_fn, int warmup_iters = 3,
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < bench_iters; ++i) launch_fn();
     CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));//Wait for the 'stop' event to complete on the GPU
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float total_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));

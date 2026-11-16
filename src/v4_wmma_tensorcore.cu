@@ -947,6 +947,7 @@ int main(int argc, char** argv) {
     printf("  [verify] tolerances: atol=%g rtol=%g\n", kVerifyAtol,
            kVerifyRtol);
     float* h_C_ref = nullptr;
+    int verify_failures = 0;  // any FAIL makes the program exit non-zero
     if (N <= 512) {
         float* h_A_q = (float*)malloc(size_A * sizeof(float));
         float* h_B_q = (float*)malloc(size_B * sizeof(float));
@@ -957,8 +958,9 @@ int main(int argc, char** argv) {
         free(h_A_q);
         free(h_B_q);
         printf("  [verify cuBLAS vs CPU ref]\n");
-        verify_result(h_C_cublas, h_C_ref, (int)size_C, kVerifyAtol,
-                      kVerifyRtol);
+        if (!verify_result(h_C_cublas, h_C_ref, (int)size_C, kVerifyAtol,
+                           kVerifyRtol))
+            ++verify_failures;
     } else {
         printf("  [verify] N>512: CPU reference skipped, checking against "
                "cuBLAS only\n");
@@ -980,11 +982,14 @@ int main(int argc, char** argv) {
                               cudaMemcpyDeviceToHost));
         if (h_C_ref) {
             printf("  [verify %s vs CPU ref]\n", name);
-            verify_result(h_C, h_C_ref, (int)size_C, kVerifyAtol,
-                          kVerifyRtol);
+            if (!verify_result(h_C, h_C_ref, (int)size_C, kVerifyAtol,
+                               kVerifyRtol))
+                ++verify_failures;
         }
         printf("  [verify %s vs cuBLAS]\n", name);
-        verify_result(h_C, h_C_cublas, (int)size_C, kVerifyAtol, kVerifyRtol);
+        if (!verify_result(h_C, h_C_cublas, (int)size_C, kVerifyAtol,
+                           kVerifyRtol))
+            ++verify_failures;
     };
 
     verify_kernel("naive wmma kernel", d_C_wmma, h_C_wmma, [&]() {
@@ -1009,6 +1014,12 @@ int main(int argc, char** argv) {
         });
     }
     free(h_C_ref);
+    if (verify_failures > 0)
+        printf("  [verify] *** %d check(s) FAILED: the benchmark numbers below "
+               "are for WRONG results ***\n",
+               verify_failures);
+    else
+        printf("  [verify] all checks passed\n");
 
     // ---------- Benchmark: naive wmma kernel ----------
     float avg_ms_wmma =
@@ -1178,5 +1189,10 @@ int main(int argc, char** argv) {
     free(h_C_warptile);
     free(h_C_cublas);
 
+    if (verify_failures > 0) {
+        fprintf(stderr, "ERROR: %d verification check(s) failed\n",
+                verify_failures);
+        return EXIT_FAILURE;
+    }
     return 0;
 }
