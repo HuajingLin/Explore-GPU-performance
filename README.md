@@ -23,6 +23,9 @@ cd gpu_perf
 cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
+test:
+nvcc -O3 -arch=sm_75 -Xptxas -v register_blocking_gemm.cu
+
 # 3. Run a specific version (N is the matrix size; square matrix where M=N=K=N)
 ./build/v0_naive 1024       # V0 naive
 ./build/v1_tile32 1024      # V1 v1_tile8, v1_tile16, v1_tile32 based on tile sizes.
