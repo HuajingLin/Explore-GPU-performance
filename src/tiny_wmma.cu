@@ -37,9 +37,7 @@ int main(){
     }
     tiny_wmma_gemm<<<1, 32>>>(A, B, C);
     cudaDeviceSynchronize();
-    for(int i=0; i<16*16; i++){
-        printf("C[%d] = %6.1f\n", i, C[i]);
-    }
+    
 
     cudaFree(A);
     cudaFree(B);
