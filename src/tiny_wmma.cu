@@ -6,13 +6,14 @@ using namespace nvcuda;
 
 __global__ void tiny_wmma_gemm(const half* A, const half* B, float* C){
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
     wmma::fill_fragment(c, 0.0f);
     wmma::load_matrix_sync(a, A, 16);   // all 32 lanes cooperate
     wmma::load_matrix_sync(b, B, 16);
     wmma::mma_sync(c, a, b, c);
     // peek inside: which elements does each lane hold?
+    printf("c.num_elements = %d\n", c.num_elements);
     for(int i = 0; i< c.num_elements; i++){
         printf("lane %2d: c.x[%d] = %6.1f\n", threadIdx.x, i, c.x[i]);
     }
