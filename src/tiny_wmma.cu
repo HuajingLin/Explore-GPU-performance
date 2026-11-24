@@ -40,8 +40,10 @@ __global__ void tiny_wmma(const half* A, const half* B, float* C) {
     // The layout is not guaranteed by the WMMA API; this is only to learn.
     for (int i = 0; i < c.num_elements; ++i) {
         const int v = static_cast<int>(c.x[i]);
-        printf("lane %2d  c.x[%d] = %3d  -> C[%2d][%2d]\n", threadIdx.x, i, v,
+        if (threadIdx.x == 0) {
+            printf("lane %2d  c.x[%d] = %3d  -> C[%2d][%2d]\n", threadIdx.x, i, v,
                v / kN, v % kN);
+        }
     }
 
     wmma::store_matrix_sync(C, c, kN, wmma::mem_row_major);
