@@ -66,6 +66,7 @@ gpu_perf/
 ├── .gitignore
 ├── src/                  # Kernel source code for each version + common utilities
 │   ├── common.cuh        # Common utility functions
+│   ├── tiny_wmma.cu      # test
 │   ├── v0_naive.cu
 │   ├── v1_shared_tiling.cu
 │   ├── v2_register_blocking.cu
